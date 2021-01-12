@@ -138,36 +138,42 @@ static ssize_t ts_read(struct file *file, char __user *ptr,
 	struct dvb_device *dvbdev = file->private_data;
 	struct ca_channel *chan = dvbdev->priv;
 	int count;
-	int i=0;
-	int timeout;
 
 //	printk("%s channel index:%d \n",__func__,  chan->channel_index);
 	count = kfifo_len(&chan->r_fifo); 
-	while (count < size)
+	while (count < TS_PACKET_SIZE)
 	{
-		chan->read_ready=0;
-		timeout = wait_event_timeout(chan->read_wq, chan->read_ready == 1, HZ);
-		if (timeout <= 0) {
-			printk("ts_read buffer fulled!\n");
-			return 0;
-		}
+		if (file->f_flags & O_NONBLOCK)
+			break;
+		chan->read_ready = 0;
+		if (wait_event_interruptible(chan->read_wq,
+					     chan->read_ready == 1) < 0)
+			break;
+		count = kfifo_len(&chan->r_fifo);
+	}
+	unsigned int copied = -EAGAIN;
+	if (count > size)
+		count = size;
+	if (count >= TS_PACKET_SIZE && kfifo_to_user(&chan->r_fifo, ptr, count, &copied))
+		return -EFAULT;
 
-		count = kfifo_len(&chan->r_fifo); 
-		i++;
-		if (i > 5)
-		{
-			printk("ts_read buffer empty !\n");
-			return 0;
-		}
-	}
-	if (count >= size){
-		unsigned int copied;
-		unsigned int ret;
-		ret = kfifo_to_user(&chan->r_fifo, ptr, size, &copied);
-		if (size != copied)
-			printk("%s size:%u  %u\n", __func__, size, copied);
-	}
-	return size;
+	return copied;
+}
+
+static __poll_t ts_poll(struct file *file, poll_table *wait)
+{
+	struct dvb_device *dvbdev = file->private_data;
+	struct ca_channel *chan = dvbdev->priv;
+
+	__poll_t mask = 0;
+
+	poll_wait(file, &chan->read_wq, wait);
+	poll_wait(file, &chan->write_wq, wait);
+	if (kfifo_len(&chan->r_fifo) >= TS_PACKET_SIZE)
+		mask |= EPOLLIN | EPOLLRDNORM;
+	if (kfifo_avail(&chan->w_fifo) >= TS_PACKET_SIZE)
+		mask |= EPOLLOUT | EPOLLWRNORM;
+	return mask;
 }
 
 static int ts_open(struct inode *inode, struct file *filp)
@@ -300,6 +306,7 @@ static const struct file_operations ci_fops = {
 	.read    = ts_read,
 	.write   = ts_write,
 	.open    = ts_open,
+	.poll    = ts_poll,
 	.unlocked_ioctl = tbsci_ioctl,
 	.release = ts_release,
 };
@@ -339,6 +346,24 @@ static void write_dma_work(struct work_struct *p_work)
 	}
 	spin_unlock(&pchannel->writelock);
 		
+}
+
+// Drop the empty packets
+static int copy_non_null_ts_to_kfifo(struct kfifo *r_fifo, void *source, int size) {
+	int i, len = 0;
+	uint8_t *src = (uint8_t *)source;
+	for (i = 0; i < size; i += TS_PACKET_SIZE) {
+		int pid = (src[i + 1] & 0x1F) * 256 + src[i + 2];
+		if (pid < 0x1FFF) {
+			int copied = kfifo_in(r_fifo, src + i,
+				 TS_PACKET_SIZE);
+			if (copied < 0) {
+				return copied;
+			}
+			len += copied;
+		}
+	}
+	return len;
 }
 
 static void read_dma_work(struct work_struct *p_work)
@@ -387,7 +412,10 @@ static void read_dma_work(struct work_struct *p_work)
 
 			count = kfifo_avail(&pchannel->r_fifo); 
 			if (count >= READ_CELL_SIZE){
-				ret = kfifo_in(&pchannel->r_fifo, data+pchannel->dma_offset, READ_CELL_SIZE); 
+				ret = copy_non_null_ts_to_kfifo(
+					&pchannel->r_fifo,
+					data + pchannel->dma_offset,
+					READ_CELL_SIZE);
 				pchannel->read_ready = 1;
 				wake_up(&pchannel->read_wq);	
 
@@ -880,7 +908,8 @@ static int tbs_adapters_init(struct tbs_pcie_dev *dev)
 {
 	int i=0;
 	int ret=0;
-		struct ca_channel *tbsca;
+	struct ca_channel *tbsca;
+	struct pci_dev *pci = dev->pdev;
 
 	for(i=0;i<CHANNELS;i++){
 		tbsca = &dev->channnel[i];
@@ -926,10 +955,14 @@ static int tbs_adapters_init(struct tbs_pcie_dev *dev)
 		tbsca->channel_index = i;
 		tbsca->status = 0;
 		mutex_init(&tbsca->lock);
-		ret = dvb_ca_en50221_init(&dev->adapter, &tbsca->ca, 0, 1);
-		if (ret < 0) {
-			printk("%s ERROR: dvb_ca_en50221_init\n", __func__);;
-			goto fail;
+
+		if((pci->subsystem_vendor == 0x6900)&&(pci->subsystem_device == 0x0001))
+		{
+			ret = dvb_ca_en50221_init(&dev->adapter, &tbsca->ca, 0, 1);
+			if (ret < 0) {
+				printk("%s ERROR: dvb_ca_en50221_init\n", __func__);;
+				goto fail;
+			}
 		}
 		ret = dvb_register_device(&dev->adapter, &tbsca->ci_dev,&tbs_ci, (void *) tbsca,DVB_DEVICE_SEC,0);
 		if (ret < 0) {
@@ -1040,7 +1073,7 @@ static int tbsci_probe(struct pci_dev *pdev,
 	}
 
 	pci_set_drvdata(pdev, dev);
-
+			
 	ret = tbs_adapters_init(dev);
 	if (ret < 0)
 	{
@@ -1076,6 +1109,7 @@ fail0:
 
 static const struct pci_device_id tbsci_id_table[] = {
 	MAKE_ENTRY(0x544d, 0x6178, 0x6900, 0x0001, NULL),
+	MAKE_ENTRY(0x544d, 0x6178, 0x6900, 0x0002, NULL),
 	{}};
 MODULE_DEVICE_TABLE(pci, tbsci_id_table);
 

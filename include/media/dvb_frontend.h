@@ -505,6 +505,10 @@ struct dvb_frontend_ops {
 	void(*reg_i2cread)( struct dvb_frontend *fe,struct usbi2c_access *pi2cinf);
 	void(*reg_i2cwrite)( struct dvb_frontend *fe,struct usbi2c_access *pi2cinf);
 
+	void(*eeprom_read)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
+	void(*eeprom_write)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
+    
+    int (*read_temp)(struct dvb_frontend* fe, s16* temp);
 };
 
 #ifdef __DVB_CORE__
@@ -636,8 +640,9 @@ struct dtv_frontend_properties {
 
 	/* Multistream specifics */
 	u32			stream_id;
+	u32			modcode;
 
-	/* Physical Layer Scrambling specifics */
+    /* Physical Layer Scrambling specifics */
 	u32			scrambling_sequence_index;
 
 	/* ATSC-MH specifics */

@@ -1,3 +1,5 @@
+.. SPDX-License-Identifier: GPL-2.0
+
 
 .. The Linux Kernel documentation master file, created by
    sphinx-quickstart on Fri Feb 12 13:51:46 2016.
@@ -46,6 +48,7 @@ platform firmwares.
    :maxdepth: 2
 
    firmware-guide/index
+   devicetree/index
 
 Application-developer documentation
 -----------------------------------
@@ -157,7 +160,7 @@ implementation.
    ia64/index
    m68k/index
    mips/index
-   nios2/nios2
+   nios2/index
    openrisc/index
    parisc/index
    powerpc/index
@@ -178,6 +181,20 @@ subprojects.
    :maxdepth: 2
 
    filesystems/ext4/index
+
+Other documentation
+-------------------
+
+There are several unsorted documents that don't seem to fit on other parts
+of the documentation body, or may require some adjustments and/or conversion
+to ReStructured Text format, or are simply too old.
+
+.. toctree::
+   :maxdepth: 2
+
+   staging/index
+   watch_queue
+
 
 Translations
 ------------

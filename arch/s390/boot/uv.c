@@ -8,8 +8,9 @@
 int __bootdata_preserved(prot_virt_guest);
 #endif
 #if IS_ENABLED(CONFIG_KVM)
-struct uv_info __bootdata_preserved(uv_info);
+int __bootdata_preserved(prot_virt_host);
 #endif
+struct uv_info __bootdata_preserved(uv_info);
 
 void uv_query_info(void)
 {

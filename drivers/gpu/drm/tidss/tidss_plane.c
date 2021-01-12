@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2018 Texas Instruments Incorporated - http://www.ti.com/
+ * Copyright (C) 2018 Texas Instruments Incorporated - https://www.ti.com/
  * Author: Tomi Valkeinen <tomi.valkeinen@ti.com>
  */
 
@@ -10,6 +10,7 @@
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_fb_cma_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
 
 #include "tidss_crtc.h"
 #include "tidss_dispc.h"
@@ -22,7 +23,7 @@ static int tidss_plane_atomic_check(struct drm_plane *plane,
 				    struct drm_plane_state *state)
 {
 	struct drm_device *ddev = plane->dev;
-	struct tidss_device *tidss = ddev->dev_private;
+	struct tidss_device *tidss = to_tidss(ddev);
 	struct tidss_plane *tplane = to_tidss_plane(plane);
 	const struct drm_format_info *finfo;
 	struct drm_crtc_state *crtc_state;
@@ -101,7 +102,7 @@ static void tidss_plane_atomic_update(struct drm_plane *plane,
 				      struct drm_plane_state *old_state)
 {
 	struct drm_device *ddev = plane->dev;
-	struct tidss_device *tidss = ddev->dev_private;
+	struct tidss_device *tidss = to_tidss(ddev);
 	struct tidss_plane *tplane = to_tidss_plane(plane);
 	struct drm_plane_state *state = plane->state;
 	u32 hw_videoport;
@@ -133,7 +134,7 @@ static void tidss_plane_atomic_disable(struct drm_plane *plane,
 				       struct drm_plane_state *old_state)
 {
 	struct drm_device *ddev = plane->dev;
-	struct tidss_device *tidss = ddev->dev_private;
+	struct tidss_device *tidss = to_tidss(ddev);
 	struct tidss_plane *tplane = to_tidss_plane(plane);
 
 	dev_dbg(ddev->dev, "%s\n", __func__);
@@ -141,7 +142,16 @@ static void tidss_plane_atomic_disable(struct drm_plane *plane,
 	dispc_plane_enable(tidss->dispc, tplane->hw_plane_id, false);
 }
 
+static void drm_plane_destroy(struct drm_plane *plane)
+{
+	struct tidss_plane *tplane = to_tidss_plane(plane);
+
+	drm_plane_cleanup(plane);
+	kfree(tplane);
+}
+
 static const struct drm_plane_helper_funcs tidss_plane_helper_funcs = {
+	.prepare_fb = drm_gem_fb_prepare_fb,
 	.atomic_check = tidss_plane_atomic_check,
 	.atomic_update = tidss_plane_atomic_update,
 	.atomic_disable = tidss_plane_atomic_disable,
@@ -151,7 +161,7 @@ static const struct drm_plane_funcs tidss_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.reset = drm_atomic_helper_plane_reset,
-	.destroy = drm_plane_cleanup,
+	.destroy = drm_plane_destroy,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
 };
@@ -175,7 +185,7 @@ struct tidss_plane *tidss_plane_create(struct tidss_device *tidss,
 			   BIT(DRM_MODE_BLEND_COVERAGE));
 	int ret;
 
-	tplane = devm_kzalloc(tidss->dev, sizeof(*tplane), GFP_KERNEL);
+	tplane = kzalloc(sizeof(*tplane), GFP_KERNEL);
 	if (!tplane)
 		return ERR_PTR(-ENOMEM);
 
@@ -190,7 +200,7 @@ struct tidss_plane *tidss_plane_create(struct tidss_device *tidss,
 				       formats, num_formats,
 				       NULL, type, NULL);
 	if (ret < 0)
-		return ERR_PTR(ret);
+		goto err;
 
 	drm_plane_helper_add(&tplane->plane, &tidss_plane_helper_funcs);
 
@@ -203,15 +213,19 @@ struct tidss_plane *tidss_plane_create(struct tidss_device *tidss,
 						default_encoding,
 						default_range);
 	if (ret)
-		return ERR_PTR(ret);
+		goto err;
 
 	ret = drm_plane_create_alpha_property(&tplane->plane);
 	if (ret)
-		return ERR_PTR(ret);
+		goto err;
 
 	ret = drm_plane_create_blend_mode_property(&tplane->plane, blend_modes);
 	if (ret)
-		return ERR_PTR(ret);
+		goto err;
 
 	return tplane;
+
+err:
+	kfree(tplane);
+	return ERR_PTR(ret);
 }

@@ -485,6 +485,9 @@ static int anx6345_get_modes(struct drm_connector *connector)
 
 	num_modes += drm_add_edid_modes(connector, anx6345->edid);
 
+	/* Driver currently supports only 6bpc */
+	connector->display_info.bpc = 6;
+
 unlock:
 	if (power_off)
 		anx6345_poweroff(anx6345);
@@ -504,10 +507,6 @@ static const struct drm_connector_helper_funcs anx6345_connector_helper_funcs = 
 static void
 anx6345_connector_destroy(struct drm_connector *connector)
 {
-	struct anx6345 *anx6345 = connector_to_anx6345(connector);
-
-	if (anx6345->panel)
-		drm_panel_detach(anx6345->panel);
 	drm_connector_cleanup(connector);
 }
 
@@ -572,19 +571,12 @@ static int anx6345_bridge_attach(struct drm_bridge *bridge,
 		return err;
 	}
 
-	if (anx6345->panel) {
-		err = drm_panel_attach(anx6345->panel, &anx6345->connector);
-		if (err) {
-			DRM_ERROR("Failed to attach panel: %d\n", err);
-			return err;
-		}
-	}
-
 	return 0;
 }
 
 static enum drm_mode_status
 anx6345_bridge_mode_valid(struct drm_bridge *bridge,
+			  const struct drm_display_info *info,
 			  const struct drm_display_mode *mode)
 {
 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)

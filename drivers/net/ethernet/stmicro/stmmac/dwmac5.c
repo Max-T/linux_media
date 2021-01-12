@@ -305,17 +305,13 @@ int dwmac5_safety_feat_dump(struct stmmac_safety_stats *stats,
 static int dwmac5_rxp_disable(void __iomem *ioaddr)
 {
 	u32 val;
-	int ret;
 
 	val = readl(ioaddr + MTL_OPERATION_MODE);
 	val &= ~MTL_FRPE;
 	writel(val, ioaddr + MTL_OPERATION_MODE);
 
-	ret = readl_poll_timeout(ioaddr + MTL_RXP_CONTROL_STATUS, val,
+	return readl_poll_timeout(ioaddr + MTL_RXP_CONTROL_STATUS, val,
 			val & RXPI, 1, 10000);
-	if (ret)
-		return ret;
-	return 0;
 }
 
 static void dwmac5_rxp_enable(void __iomem *ioaddr)
@@ -624,7 +620,7 @@ int dwmac5_est_configure(void __iomem *ioaddr, struct stmmac_est *cfg,
 		total_offset += offset;
 	}
 
-	total_ctr = cfg->ctr[0] + cfg->ctr[1] * 1000000000;
+	total_ctr = cfg->ctr[0] + cfg->ctr[1] * 1000000000ULL;
 	total_ctr += total_offset;
 
 	ctr_low = do_div(total_ctr, 1000000000);
