@@ -86,6 +86,9 @@ struct mxl_base {
 
 	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);
 	void (*read_properties) (struct i2c_adapter *i2c,u8 reg, u32 *buf);
+
+	void (*write_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 buf);
+	void (*read_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 *buf);
 };
 
 struct mxl {
@@ -490,9 +493,11 @@ static int read_status(struct dvb_frontend *fe, enum fe_status *status)
 	HYDRA_DEMOD_STATUS_UNLOCK(state, state->demod);
 	mutex_unlock(&state->base->status_lock);
 
-	p->strength.len = 1;
+	p->strength.len = 2;
 	p->strength.stat[0].scale = FE_SCALE_DECIBEL;
 	p->strength.stat[0].svalue = (s16)reg[0] * 10;
+	p->strength.stat[1].scale = FE_SCALE_RELATIVE;
+	p->strength.stat[1].uvalue = (100 + (s16)reg[0]/100) * 656;
 
 	/* Read demod lock status */
 	mutex_lock(&state->base->status_lock);
@@ -522,9 +527,11 @@ static int read_status(struct dvb_frontend *fe, enum fe_status *status)
 	HYDRA_DEMOD_STATUS_UNLOCK(state, state->demod);
 	mutex_unlock(&state->base->status_lock);
 
-	p->cnr.len = 1;
+	p->cnr.len = 2;
 	p->cnr.stat[0].scale = FE_SCALE_DECIBEL;
 	p->cnr.stat[0].svalue = (s16)reg[0] * 10;
+	p->cnr.stat[1].scale = FE_SCALE_RELATIVE;
+	p->cnr.stat[1].uvalue = reg[0] * 33;
 
 	/* Read BER */
 	mutex_lock(&state->base->status_lock);
@@ -589,8 +596,14 @@ static int read_status(struct dvb_frontend *fe, enum fe_status *status)
 static int read_signal_strength(struct dvb_frontend *fe, u16 *strength)
 {
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
+	int i;
 
-	*strength = p->strength.stat[0].scale == FE_SCALE_DECIBEL ? ((100000 + (s32)p->strength.stat[0].svalue) / 1000) * 656 : 0;
+	for (i=0; i < p->strength.len; i++) {
+		if (p->strength.stat[i].scale == FE_SCALE_RELATIVE)
+			*strength = (u16)p->strength.stat[i].uvalue;
+		else if (p->strength.stat[i].scale == FE_SCALE_DECIBEL)
+			*strength = ((100000 + (s32)p->strength.stat[i].svalue)/1000) * 656;
+	}
 
 	return 0;
 
@@ -599,14 +612,12 @@ static int read_signal_strength(struct dvb_frontend *fe, u16 *strength)
 static int read_snr(struct dvb_frontend *fe, u16 *snr)
 {
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
+	int i;
 
-	if (p->cnr.stat[0].scale == FE_SCALE_DECIBEL) {
-		 *snr = (s32)p->cnr.stat[0].svalue / 100;
-		 if (*snr > 200)
-			  *snr = 0xffff;
-		 else
-			  *snr *= 328;
-	} else *snr = 0;
+	*snr = 0;
+	for (i=0; i < p->cnr.len; i++)
+		if (p->cnr.stat[i].scale == FE_SCALE_RELATIVE)
+		  *snr = (u16)p->cnr.stat[i].uvalue;
 
 	return 0;
 }
@@ -815,6 +826,39 @@ static void spi_write(struct dvb_frontend *fe,struct ecp3_info *ecp3inf)
 	return ;
 }
 
+static void eeprom_read(struct dvb_frontend *fe, struct eeprom_info *eepinf)
+{
+	struct mxl *state = fe->demodulator_priv;
+	struct i2c_adapter *adapter = state->base->i2c;
+
+	if (state->base->read_eeprom)
+		state->base->read_eeprom(adapter,eepinf->reg, &(eepinf->data));
+	return ;
+}
+
+static void eeprom_write(struct dvb_frontend *fe,struct eeprom_info *eepinf)
+{
+	struct mxl *state = fe->demodulator_priv;
+	struct i2c_adapter *adapter = state->base->i2c;
+
+	if (state->base->write_eeprom)
+		state->base->write_eeprom(adapter,eepinf->reg, eepinf->data);
+	return ;
+}
+
+static int read_temp(struct dvb_frontend *fe, s16 *temp)
+{
+	struct mxl *state = fe->demodulator_priv;
+	int status;
+	u32 regData = 0;
+
+	mutex_lock(&state->base->status_lock);
+	status = read_register(state, HYDRA_TEMPARATURE, &regData);
+	mutex_unlock(&state->base->status_lock);
+	*temp=status ? 0: regData;
+	return 0;
+}
+
 static struct dvb_frontend_ops mxl_ops = {
 	.delsys = { SYS_DVBS, SYS_DVBS2, SYS_DSS },
 	.info = {
@@ -847,6 +891,9 @@ static struct dvb_frontend_ops mxl_ops = {
 
 	.spi_read			= spi_read,
 	.spi_write			= spi_write,
+	.eeprom_read		= eeprom_read,
+	.eeprom_write		= eeprom_write,
+	.read_temp			= read_temp,
 };
 
 static struct mxl_base *match_base(struct i2c_adapter *i2c, u8 adr)
@@ -1529,6 +1576,9 @@ struct dvb_frontend *mxl58x_attach(struct i2c_adapter *i2c,
 		base->count = 1;
 		base->write_properties = cfg->write_properties;
 		base->read_properties = cfg->read_properties;
+		base->write_eeprom = cfg->write_eeprom;
+		base->read_eeprom = cfg->read_eeprom;
+
 		mutex_init(&base->i2c_lock);
 		mutex_init(&base->status_lock);
 		state->base = base;

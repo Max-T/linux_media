@@ -31,11 +31,11 @@
 
 enum fe_extended_caps {
 	FE_EXTENDED_CAPS_IS_STUPID = 0x00,
-	FE_CAN_SPECTRUMSCAN        = 0x01,
+	FE_CAN_SPECTRUM_SWEEP      = 0x01,
 	FE_CAN_IQ                  = 0x02,
 	FE_CAN_BLINDSEARCH         = 0x04,
-	FE_CAN_CONSTELLATION       = 0x10,
-	FE_CAN_MODCOD		   = 0x08
+	FE_CAN_SPECTRUM_FFT        = 0x08,
+	FE_CAN_MODCOD		           = 0x10,
 };
 
 /**
@@ -168,11 +168,28 @@ struct dvb_frontend_info {
 };
 
 struct dvb_frontend_extended_info {
-	char       card_name[64]; //human readable name of tuner card
-	char       adapter_name[64]; //human readable name of adapter
-	char       card_address[64]; //name of the linux bus to which the device is attached (e.g. pci-express slot)
-	char       adapter_address[64]; //unique name of adapter depending on pci-express address and physical input
-	char       name[64];
+	char     card_name[64]; //human readable name of tuner card
+	char     adapter_name[64]; //human readable name of adapter
+	char     card_address[64]; //name of the linux bus to which the device is attached (e.g. pci-express slot)
+	char     card_short_name[64]; //unique name of adapter depending on pci-express address and physical input
+	u8       supports_neumo; /*historically we relied on FE_CAN... to indicate supported features,
+														 but in future we will rely on data returned by FE_GET_EXTENDED_INFO
+														 Note that FE_GET_EXTENDED_INFO works on all drivers, even non neumo ones:
+														 it is available as soon as neumo support is activated in dvb_api. Legacy
+														 drivers will initialize fields thet don;t know to zero, but in some case
+														 (e.g., rf_in) 0 is a valid value. The fe_info.supports_neumo flag, when
+														 set - indicates that such fields have been properly initialized anyway
+													 */
+	u8       num_rf_inputs;
+	s8       default_rf_input;
+	u8       reserved3;
+	s32      reserved4;
+	s64      card_mac_address;      //unique identifier for card
+	s64      adapter_mac_address;   //unique identifier for adapter
+	char     unused[64 - 24 - 16];
+	s8       rf_inputs[16];  /*rf inputs to which thios tuner can connect If num_rf_inputs==0,
+													then the adapter can connect to a single rf_input, which equals
+													adapter_no*/
 	u32      frequency_min;
 	u32      frequency_max;
 	u32      frequency_stepsize;
@@ -273,19 +290,22 @@ enum fe_sec_mini_cmd {
  * @FE_HAS_SYNC:	Synchronization bytes was found.
  * @FE_HAS_LOCK:	Digital TV were locked and everything is working.
  * @FE_TIMEDOUT:	Fo lock within the last about 2 seconds.
- * @FE_REINIT:		Frontend was reinitialized, application is recommended
- *			to reset DiSEqC, tone and parameters.
- *
+ * @FE_HAS_TIMING_LOCK:		TIming loop has locked
+ * @FE_IDLE:		Frontend has gone idle
+ * size: 4 byes
  */
 enum fe_status {
 	FE_NONE			= 0x00,
-	FE_HAS_SIGNAL		= 0x01,
+	FE_HAS_SIGNAL		= 0x01, //not useful
 	FE_HAS_CARRIER		= 0x02,
 	FE_HAS_VITERBI		= 0x04,
 	FE_HAS_SYNC		= 0x08,
 	FE_HAS_LOCK		= 0x10,
 	FE_TIMEDOUT		= 0x20,
-	FE_REINIT		= 0x40,
+	FE_REINIT		= 0x40, //not used internally, but checked by dvblast, so must remain 0
+	FE_IDLE		= 0x80,
+	FE_OUT_OF_RESOURCES = 0x100, //e.g., No LLR for stid135
+	FE_HAS_TIMING_LOCK		= 0x200, //was FE_REINIT; not used anyway
 };
 
 /**
@@ -344,6 +364,26 @@ enum fe_code_rate {
 	FEC_5_11,
 	FEC_1_4,
 	FEC_1_3,
+	FEC_11_15,
+	FEC_11_20,
+	FEC_11_45,
+	FEC_13_18,
+	FEC_13_45,
+	FEC_14_45,
+	FEC_23_36,
+	FEC_25_36,
+	FEC_26_45,
+	FEC_28_45,
+	FEC_29_45,
+	FEC_31_45,
+	FEC_32_45,
+	FEC_4_15,
+	FEC_5_9,
+	FEC_7_15,
+	FEC_77_90,
+	FEC_7_9,
+	FEC_8_15,
+	FEC_9_20
 };
 
 /**
@@ -561,7 +601,8 @@ enum fe_interleaving {
 
 #define DTV_STREAM_ID		42
 #define DTV_ISDBS_TS_ID_LEGACY	DTV_STREAM_ID
-#define DTV_DVBT2_PLP_ID_LEGACY	43
+#define DTV_DVBT2_PLP_ID_LEGACY	DTV_STREAM_ID
+#define DTV_MODCODE		43
 
 #define DTV_ENUM_DELSYS		44
 
@@ -614,7 +655,12 @@ enum fe_interleaving {
 #define DTV_SPECTRUM 84
 #define DTV_MAX_SYMBOL_RATE	85 //for blindscan
 #define DTV_CONSTELLATION 86
-#define DTV_MAX_COMMAND	 DTV_CONSTELLATION
+#define DTV_HEARTBEAT 87
+#define DTV_BITRATE 88
+#define DTV_LOCKTIME 89
+#define DTV_MATYPE_LIST		90 //retrieve list of present matypesand stream_ids
+#define DTV_RF_INPUT 91
+#define DTV_MAX_COMMAND	 DTV_RF_INPUT
 
 //commands for controlling long running algorithms via FE_ALGO_CTRL ioctl
 #define DTV_STOP 1
@@ -721,7 +767,7 @@ enum fe_delivery_system {
 	SYS_DVBC2,
 	SYS_DVBS2X,
 	SYS_DCII,
-	SYS_AUTO
+	SYS_AUTO //22
 };
 
 /**
@@ -750,9 +796,9 @@ enum fe_algorithm {
 	ALGORITHM_COLD_BEST_GUESS,
 	ALGORITHM_BLIND,
 	ALGORITHM_BLIND_BEST_GUESS,
-	ALGORITHM_SEARCH,
-	ALGORITHM_SEARCH_NEXT,
-	ALGORITHM_BANDWIDTH,
+	//ALGORITHM_SEARCH,
+	//ALGORITHM_SEARCH_NEXT,
+	//ALGORITHM_BANDWIDTH,
 };
 
 /* backward compatibility definitions for delivery systems */
@@ -842,7 +888,8 @@ enum atscmh_rs_code_mode {
 };
 
 #define NO_STREAM_ID_FILTER	(~0U)
-#define LNA_AUTO                (~0U)
+#define LNA_AUTO            (~0U)
+#define MODCODE_ALL         (~0U)
 
 /**
  * enum fecap_scale_params - scale types for the quality parameters.
@@ -932,6 +979,25 @@ enum dtv_fe_constellation_method {
 	CONSTELLATION_METHOD_DEFAULT,
 };
 
+struct spectral_peak_t {
+	s32 freq; //frequency of current peak
+	s32 symbol_rate; //estimated symbolrate of current peak
+	s32 snr;
+	s32 level;
+};
+
+/**
+ * struct dtv_pls_search_codes
+ * This is passed as an input to FE_GET_PROPERTY
+ * The caller should initialise the fields as followed
+ * @num_codes: numver of elements prvided in codes
+ * @codes: data array provided by caller, codes will be read from this
+ *
+ */
+struct dtv_pls_search_list {
+	int num_codes;
+	u32* codes;
+};
 
 /**
  * struct dtv_fe_spectrum - decriptor for a spectrum scan buffer
@@ -948,10 +1014,11 @@ enum dtv_fe_constellation_method {
  *
  */
 struct dtv_fe_spectrum {
-	u32 *freq;
-	s32 *rf_level;
-	s32 *rf_band;
+	u32 *freq;     //frequencies of spectrum will be returned in freq[num_freq]
+	s32 *rf_level; //rf_level of spectrum  will be returned in rf_level[num_freq]
+	struct spectral_peak_t *candidates; //frequencies which were tried for locking are returned in candidate_frequencies[num_candidates]
 	u32 num_freq;
+	u32 num_candidates;
 	u32 scale; //FE_SCALE_DECIBEL; or FE_SCALE_RELATIVE
 	u8 spectrum_method;
 };
@@ -986,6 +1053,11 @@ struct dtv_fe_constellation {
 	u8 constel_select;
 };
 
+struct dtv_matype_list {
+	u32 num_entries;
+	u16* matypes;
+};
+
 
 /**
  * struct dtv_property - store one of frontend command and its value
@@ -1012,6 +1084,8 @@ struct dtv_property {
 		struct dtv_fe_stats st;
 		struct dtv_fe_spectrum spectrum;
 		struct dtv_fe_constellation constellation;
+		struct dtv_matype_list matype_list;
+		struct dtv_pls_search_list pls_search_codes;
 		struct {
 			u8 data[32];
 			u32 len;
@@ -1089,7 +1163,8 @@ struct dtv_algo_ctrl {
 
 #define FE_SET_PROPERTY		   _IOW('o', 82, struct dtv_properties)
 #define FE_GET_PROPERTY		   _IOR('o', 83, struct dtv_properties)
-#define FE_ALGO_CTRL		     _IOW('o', 84) struct dtv_algo_ctrl)
+#define FE_ALGO_CTRL		     _IOW('o', 84, struct dtv_algo_ctrl)
+#define FE_SET_RF_INPUT		   _IO('o', 85)
 
 
 #define FE_GET_EXTENDED_INFO		_IOR('o', 86, struct dvb_frontend_extended_info)
@@ -1214,6 +1289,12 @@ struct usbi2c_access
 	u8 buf[8];
 };
 
+struct eeprom_info
+{
+	__u8 reg;
+	__u8 data;
+};
+
 #define FE_ECP3FW_READ    _IOR('o', 90, struct ecp3_info)
 #define FE_ECP3FW_WRITE   _IOW('o', 91, struct ecp3_info)
 
@@ -1222,5 +1303,10 @@ struct usbi2c_access
 
 #define FE_REGI2C_READ    _IOR('o', 94, struct usbi2c_access)
 #define FE_REGI2C_WRITE   _IOW('o', 95, struct usbi2c_access)
+
+#define FE_EEPROM_READ    _IOR('o', 96, struct eeprom_info)
+#define FE_EEPROM_WRITE   _IOW('o', 97, struct eeprom_info)
+
+#define FE_READ_TEMP	  _IOR('o', 98, __s16)
 
 #endif /* _DVBFRONTEND_H_ */

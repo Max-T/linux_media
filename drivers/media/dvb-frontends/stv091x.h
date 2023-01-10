@@ -40,8 +40,12 @@ struct stv091x_cfg {
 	/* Hook for Lock LED */
 	void (*set_lock_led) (struct dvb_frontend *fe, int offon);
 
+	//update the FW.
 	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);
 	void (*read_properties) (struct i2c_adapter *i2c,u8 reg, u32 *buf);
+	// EEPROM access
+	void (*write_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 buf);
+	void (*read_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 *buf);
 };
 
 #if IS_REACHABLE(CONFIG_DVB_STV091X)
@@ -64,6 +68,7 @@ struct stv_base {
 
 	u8                   adr;
 	struct i2c_adapter  *i2c;
+	struct mutex         status_lock;
 	struct mutex         i2c_lock;
 	struct mutex         reg_lock;
 	int                  count;
@@ -75,9 +80,12 @@ struct stv_base {
 
 	/* Hook for Lock LED */
 	void (*set_lock_led) (struct dvb_frontend *fe, int offon);
+
 	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);
 	void (*read_properties) (struct i2c_adapter *i2c,u8 reg, u32 *buf);
 
+	void (*write_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 buf);
+	void (*read_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 *buf);
 };
 
 enum ReceiveMode { Mode_None, Mode_DVBS, Mode_DVBS2, Mode_Auto };
@@ -128,11 +136,47 @@ struct stv_constellation_scan_state {
 	int constel_select;
 };
 
+struct stv_isi_struct_t
+{
+	u32 isi_bitset[8]; //bitset; 1 bit indicates corresponding ISI is in use
+};
+typedef  struct stv_isi_struct_t  stv_isi_struct;
+
+
+struct stv_signal_info {
+	//bool timedout; /*tuning has timed out*/
+	bool fec_locked;
+	bool demod_locked;
+	bool satellite_scan;
+	///existing data
+	bool        has_signal;   /*tuning has finished*/
+	bool        has_carrier;  /*Some signal was found*/
+	bool        has_viterbi;
+	bool        has_sync;
+	bool        has_timedout;
+	bool        has_lock;
+
+	u32 				frequency;	/* Transponder frequency (in KHz)			*/
+	u32 				symbol_rate;	/* Transponder symbol rate  (in Mbds)			*/
+	enum fe_delivery_system standard; /* Found Standard DVBS1,DVBS2 or DSS or Turbo		*/
+	//enum fe_modulation		modulation;	/* Modulation type					*/
+	s32 				power;		/* Power of the RF signal (dBm x1000)			*/
+	s32 				powerdBmx10;	/* Power of the RF signal (dBm x10000)			*/
+	s32				band_power;	/* Power of the whole freq range signal (dBm x1000)	*/
+	s32				C_N;		/* Carrier to noise ratio (dB x10)			*/
+	u32				ber;		/* Bit error rate	(x10^7)				*/
+	u8				matype;
+	u8 				isi;		/* Current value of ISI 				*/
+	u8        pls_mode;
+	u32       pls_code;
+	stv_isi_struct isi_list;
+} ;
 
 struct stv {
 	struct stv_base     *base;
 	struct dvb_frontend  fe;
-	int                  nr;
+	struct stv_signal_info signal_info;
+	int                  adapterno; //number of adapter on card, starting at 0
 	u16                  regoff;
 	u8                   i2crpt;
 	u8                   tscfgh;
@@ -160,13 +204,12 @@ struct stv {
 	u32   LastBERNumerator;
 	u32   LastBERDenominator;
 	u8    BERScale;
-	bool timedout;
-	bool fec_locked;
-	bool demod_locked;
+	s32 tuner_frequency; //last frequency tuned by the external tuner
+	s32 demod_search_stream_id;
 	bool satellite_scan;
 	s32 scan_next_frequency;
 	s32 scan_end_frequency;
-
+	int mis_mode;
 	struct stv_spectrum_scan_state scan_state;
 	struct stv_constellation_scan_state constellation_scan_state;
 };

@@ -44,10 +44,17 @@
 #include "fesat_pro_advance.h"
 #include "oxford_anafe_func.h"
 #include "stid135_initLLA_cut2.h"
+#include "neumo-scan.h"
+#include <linux/timekeeping.h>
 #include <media/dvb_frontend.h>
+
+#define dprintk(fmt, arg...)																					\
+	printk(KERN_DEBUG pr_fmt("%s:%d " fmt),  __func__, __LINE__, ##arg)
+
 /* ========================================================== */
 // Typedefs - proprietary, non generic
 
+extern bool fft_mode32;
 enum fe_stid135_ber_status {
 	ERR_MIN_THRESHOLD_REACHED,
 	BER_THRESHOLD_REACHED,
@@ -104,7 +111,7 @@ enum fe_stid135_stfe_input {
 
 /* Demod search state */
 
-typedef internal_param_ptr			fe_stid135_handle_t;
+//typedef internal_param_ptr			fe_stid135_handle_t;
 
 
 typedef u32 u32;
@@ -221,7 +228,6 @@ struct mc_array_customer {
 	s16 snr;
 };
 
-
 /*
 			Singleton structure, one per chip (i.e., the same for all 8 demods and all 4 tuners
 			on tbs6909x. Created in fe_stid135_init.
@@ -251,7 +257,6 @@ struct fe_stid135_internal_param {
 	BOOL				mis_mode[8]; /* Memorisation of MIS mode */
 	struct modcod_data		mc_flt[NB_SAT_MODCOD];
 #endif
-	struct mutex *master_lock;
 };
 
 
@@ -300,19 +305,21 @@ struct status_bit_fields {
 };
 
 
+struct lock_t {
+	struct mutex m;
+	ktime_t lock_time;
+	int adapter_no;
+	const char* func;
+	int line;
+};
 
-/*
-	Singleton structure, one per chip (i.e., the same for all 8 demods and all 4 tuners
-	on tbs6909x. Created in fe_stid135_init.
-*/
 
-typedef void*			fe_stid135_handle_t;
 struct stv_base {
 	struct list_head     stvlist;
 
 	u8                   adr;
 	struct i2c_adapter  *i2c;
-	struct mutex         status_lock;
+	struct lock_t         lock;
 	int                  count;
 	u32                  extclk;
 	u8                   ts_mode;
@@ -320,16 +327,14 @@ struct stv_base {
 	int (*set_voltage)(struct i2c_adapter *i2c,
 		enum fe_sec_voltage voltage, u8 rf_in);
 	u8                   mode;
-#if 1 //TEST
+	s32 llr_in_use;
 	struct fe_stid135_internal_param ip;
-#else
-	fe_stid135_handle_t  handle; /*pointer to a private singleton fe_stid135_internal_param structure, which contains
-																 some per-demod state; the singleton structure is created in fe_stid135_init,
-																 which is called only once per chip */
-#endif
 	u8 tuner_use_count[4];
 	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);
 	void (*read_properties) (struct i2c_adapter *i2c,u8 reg, u32 *buf);
+
+	void (*write_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 buf);
+	void (*read_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 *buf);
 
 	//for tbs6912
 	void (*set_TSsampling)(struct i2c_adapter *i2c,int tuner,int time);
@@ -339,80 +344,25 @@ struct stv_base {
 	int vglna;
 };
 
-
-/*
-	state for spectrum scan
-*/
-
-struct spectrum_scan_state {
-	bool spectrum_present;
-	bool scan_in_progress;
-
-	s32* freq;
-	s32* spectrum;
-	int spectrum_len;
-	int fft_size; //for fft
-	s32 sample_step; //bandwidth of one spectral bin in kHz
-	s32 start_frequency;
-	s32 end_frequency;
-	s32 range; //bandwidth of current fft in kHz (covers the whole spectrum, not just the useable part)
-	int mode; //for fft
-
-	int idx_start ;//analysis starts at spectrum[idx_start]
-	int idx_end ;//analysis end at spectrum[idx_end]-1
-	int current_idx; //position at which we last stopped processing
-	s32 next_frequency; // If we found a transponder last time, this is the frequency just above the transponder bandwidth
-
-	int last_peak_idx; //index at which we last found a peak
-	s32 last_peak_freq; //frequency of current peak
-	s32 last_peak_bw; //bandwidth of current peak
-
-	int last_rise_idx; //location of last processed rising peak
-	int last_fall_idx; //location of last processed falling peak
-
-
-	int w; //window_size
-	int threshold; //minimum peak amplitude required
-	int mincount; //minimum number of above threshold detections to count as rise/fall
-
-	s32 lo_frequency_hz;
-
-
-	u8* peak_marks;
-
-};
-
-
-struct constellation_scan_state {
-	bool constallation_present;
-	bool in_progress;
-
-	struct dtv_fe_constellation_sample* samples;
-	int num_samples;
-	int samples_len;
-	int constel_select;
-};
-
 /*
 	state per adapter
  */
 struct stv {
 	struct stv_base     *base;
 	struct dvb_frontend  fe;
-	int                  nr;     //DT: adapter aka demod: 0-7
-	int                  rf_in;  //DT  tuner frontend: 0-3
-	unsigned long        tune_time;
-	int current_llr_rate;  //Remember the current reconfiguration to avoid calling hardware needlessly
-	int current_max_llr_rate;  //Remember the current reconfiguration to avoid calling hardware needlessly
+	int                  nr;     //DT: number of demod device 0-7 (st internal api uses nr+1)
+	int                  rf_in;  //DT  tuner number (0-3, corresponding to a physical input connector)
+	bool                 tuner_active;  //true of tuner defined by rf_in is actually connected and active
+	//unsigned long        tune_time;
 	struct fe_sat_signal_info signal_info;
-
+	ktime_t tune_time;
 	bool newTP; //for tbs6912
 	u32  bit_rate; //for tbs6912;
 	int loops ;//for tbs6912
 
 	s32 scan_next_frequency;
 	s32 scan_end_frequency;
-
+	s32 llr_in_use;
 	enum fe_sat_rolloff roll_off; /* manual RollOff for DVBS1/DSS only */
 
 	/* Demod */
@@ -427,7 +377,7 @@ struct stv {
 	enum fe_sat_rate		demod_puncture_rate;
 	enum fe_sat_modcode		demod_modcode;
 	enum fe_sat_modulation		demod_modulation;
-	struct fe_sat_search_result	demod_results; /* Results of the search */
+
 	fe_lla_error_t			demod_error; /* Last error encountered */
 	u32	 demod_symbol_rate; /* Symbol rate (Bds) */
 	u32	demod_search_range_hz; /* Search range (Hz) */
@@ -437,11 +387,34 @@ struct stv {
 	struct ram_byte			pid_flt;
 	struct gse_ram_byte		gse_flt;
 	BOOL	mis_mode; /* Memorisation of MIS mode */
-	struct modcod_data	mc_flt[NB_SAT_MODCOD];
+	struct modcod_data	mc_flt[NB_SAT_MODCOD]; //This must be per adapter, not per chip
 
-	struct spectrum_scan_state scan_state;
+	struct spectrum_scan_state spectrum_scan_state;
 	struct constellation_scan_state constellation_scan_state;
 };
+
+void state_lock_(struct stv* state, const char* func, int line);
+int state_trylock_(struct stv* state, const char* func, int line);
+void state_unlock_(struct stv* state, const char* func, int line);
+void state_sleep_(struct stv* state, int timems, const char* func, int line);
+
+/*
+	Singleton structure, one per chip (i.e., the same for all 8 demods and all 4 tuners
+	on tbs6909x. Created in fe_stid135_init.
+*/
+
+#define base_lock(state) \
+	state_lock_(state, __func__, __LINE__)
+
+#define base_trylock(state)										\
+	state_trylock_(state, __func__, __LINE__)
+
+#define base_unlock(state) \
+	state_unlock_(state, __func__, __LINE__)
+
+#define state_sleep(state, time)											\
+	state_sleep_(state, time, __func__, __LINE__)
+
 
 extern void print_signal_info(const char* prefix, struct fe_sat_signal_info* i);
 
@@ -537,38 +510,6 @@ fe_lla_error_t  FE_STiD135_CarrierGetQuality(STCHIP_Info_t* hChip, enum fe_stid1
 
 	fe_lla_error_t FE_STiD135_GetErrors(struct stv* state,
 		double *Errors, double *bits, double *Packets, double *Ber);
-	fe_lla_error_t fe_stid135_start_per(fe_stid135_handle_t handle, enum fe_stid135_demod demod, u8 Mode);
-
-	fe_lla_error_t fe_stid135_get_per(fe_stid135_handle_t handle,
-					enum fe_stid135_demod demod,
-					double BerTh,
-					unsigned int ErrTh,
-					double *Ber,
-					unsigned int Timeout,
-					double *NbPackets,
-					double *NbErrors,
-					unsigned char *Status);
-
-	fe_lla_error_t fe_stid135_get_fer(fe_stid135_handle_t handle,
-					enum fe_stid135_demod demod,
-					double BerTh,
-					unsigned int ErrTh,
-					double *Fer,
-					unsigned int Timeout,
-					double *NbFrames,
-					double *NbErrors,
-					unsigned char *Status);
-
-	fe_lla_error_t BerLoop(fe_stid135_handle_t handle,
-					enum fe_stid135_demod demod,
-					double BerTh,
-					unsigned int ErrTh,
-					double *Ber,
-					unsigned int Timeout,
-					double *NbPackets,
-					double *NbErrors,
-					unsigned char *Status,
-							BOOL fer_dvbs2x);
 
 fe_lla_error_t fe_stid135_get_lock_status(struct stv* state, bool*carrier_lock, bool*has_viterbi, bool* has_sync);
 fe_lla_error_t fe_stid135_get_data_status(struct stv* state, BOOL* Locked_p);
@@ -606,14 +547,10 @@ fe_lla_error_t fe_stid135_get_signal_info(struct stv* state,
 																					struct fe_sat_signal_info *pInfo,
 	u32 satellite_scan);
 
-fe_lla_error_t fe_stid135_tracking(struct stv* state,
-							 struct fe_sat_tracking_info *pTrackingInfo)  ;
-
 fe_lla_error_t FE_STiD135_Term(struct fe_stid135_internal_param* pParams);
 
 fe_lla_error_t	fe_stid135_search  (struct stv* state,
-	struct fe_sat_search_params *pSearch, struct fe_sat_search_result *pResult,
-	BOOL satellite_scan);
+	struct fe_sat_search_params *pSearch, BOOL satellite_scan);
 
 fe_lla_error_t  fe_stid135_init(struct fe_sat_init_params *pInit,
 																struct fe_stid135_internal_param*pParams);
@@ -728,9 +665,7 @@ fe_lla_error_t FE_STiD135_TunerStandby(STCHIP_Info_t* TunerHandle, FE_OXFORD_Tun
 
 fe_lla_error_t fe_stid135_get_band_power_demod_not_locked(struct stv* state, s32 *pband_rf);
 
-fe_lla_error_t estimate_band_power_demod_for_fft(struct stv* state,
-																								 u8 TunerNb,
-																								 s32 *Pbandx1000, bool* double_correction);
+fe_lla_error_t estimate_band_power_demod_for_fft(struct stv* state, u8 TunerNb, s32 *Pbandx1000);
 
 fe_lla_error_t fe_stid135_get_cut_id(struct fe_stid135_internal_param* pParams, enum device_cut_id *cut_id);
 
@@ -773,7 +708,7 @@ fe_lla_error_t fe_stid135_diseqc_init(struct fe_stid135_internal_param* pParams,
 
 fe_lla_error_t fe_stid135_diseqc_receive(struct fe_stid135_internal_param* pParams, u8 *data, u8 *nbdata);
 
-fe_lla_error_t fe_stid135_diseqc_send(struct fe_stid135_internal_param* pParams, FE_OXFORD_TunerPath_t tuner_nb, u8 *data, u8 nbdata);
+fe_lla_error_t fe_stid135_diseqc_send(struct stv* state, FE_OXFORD_TunerPath_t tuner_nb, u8 *data, u8 nbdata);
 
 fe_lla_error_t fe_stid135_diseqc_reset(struct fe_stid135_internal_param* pParams, FE_OXFORD_TunerPath_t tuner_nb);
 
@@ -794,28 +729,32 @@ fe_lla_error_t fe_stid135_set_carrier_frequency_init(struct stv* state,
 fe_lla_error_t fe_stid135_set_symbol_rate(struct stv* state,  u32 symbol_rate);
 
 fe_lla_error_t fe_stid135_manage_matype_info(struct stv* state);
-
+void fe_stid135_modcod_flt_reg_init(void);
 STCHIP_Error_t stvvglna_init(SAT_VGLNA_Params_t *InitParams, STCHIP_Info_t* *hChipHandle);
 STCHIP_Error_t stvvglna_set_standby(STCHIP_Info_t* hChip, U8 StandbyOn);
 STCHIP_Error_t stvvglna_get_status(STCHIP_Info_t* hChip, U8 *Status);
 STCHIP_Error_t stvvglna_get_gain(STCHIP_Info_t* hChip,S32 *Gain);
 STCHIP_Error_t stvvglna_term(STCHIP_Info_t* hChip);
+fe_lla_error_t get_raw_bit_rate(struct stv* state, s32* raw_bit_rate);
+fe_lla_error_t get_current_llr(struct stv* state, s32 *current_llr);
 fe_lla_error_t  set_pls_mode_code(struct stv *state, u8 pls_mode, u32 pls_code);
 fe_lla_error_t FE_STiD135_GetFECLock(struct stv* state, u32 TimeOut, BOOL* lock_bool_p);
 fe_lla_error_t fe_stid135_read_hw_matype(struct stv* state, u8 *matype, u8 *isi_read);
 bool fe_stid135_check_sis_or_mis(u8 matype);
 
 int stid135_spectral_scan_start(struct dvb_frontend *fe);
-int stid135_spectral_scan_next(struct dvb_frontend *fe,   s32 *frequency_ret);
+int stid135_spectral_scan_next(struct dvb_frontend *fe,
+															 s32 *frequency_ret,
+															 s32* symbol_rate_ret);
 int get_spectrum_scan_fft(struct dvb_frontend *fe);
-
-
-void print_spectrum_scan_state_(struct spectrum_scan_state*ss, const char* func, int line);
-#define print_spectrum_scan_state(ss)																					\
+fe_lla_error_t reserve_llr(struct stv* state, s32 required_llr);
+fe_lla_error_t reserve_llr_for_symbolrate(struct stv* state, s32 symbolrate);
+fe_lla_error_t release_llr(struct stv* state);
+void dump_llr(struct stv* state);
+void print_spectrum_scan_state_(struct spectrum_scan_state*ss,
+																const char* func, int line);
+#define print_spectrum_scan_state(ss)		\
 	print_spectrum_scan_state_(ss, __func__, __LINE__)
 
-void dump_regs(struct stv*state);
-void snapshot_regs(struct stv*state);
-void restore_regs(struct stv*state);
 
 #endif  /* ndef STID135_DRV_H */

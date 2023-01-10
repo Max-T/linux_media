@@ -9,6 +9,8 @@
 #include <linux/usb/pd_vdo.h>
 
 #include "bus.h"
+#include "class.h"
+#include "mux.h"
 
 static inline int
 typec_altmode_set_mux(struct altmode *alt, unsigned long conf, void *data)
@@ -198,7 +200,10 @@ EXPORT_SYMBOL_GPL(typec_altmode_vdm);
 const struct typec_altmode *
 typec_altmode_get_partner(struct typec_altmode *adev)
 {
-	return adev ? &to_altmode(adev)->partner->adev : NULL;
+	if (!adev || !to_altmode(adev)->partner)
+		return NULL;
+
+	return &to_altmode(adev)->partner->adev;
 }
 EXPORT_SYMBOL_GPL(typec_altmode_get_partner);
 
@@ -377,7 +382,7 @@ static int typec_probe(struct device *dev)
 	return ret;
 }
 
-static int typec_remove(struct device *dev)
+static void typec_remove(struct device *dev)
 {
 	struct typec_altmode_driver *drv = to_altmode_driver(dev->driver);
 	struct typec_altmode *adev = to_typec_altmode(dev);
@@ -395,8 +400,6 @@ static int typec_remove(struct device *dev)
 
 	adev->desc = NULL;
 	adev->ops = NULL;
-
-	return 0;
 }
 
 struct bus_type typec_bus = {

@@ -21,6 +21,9 @@ static bool enable_msi = true;
 module_param(enable_msi, bool, 0444);
 MODULE_PARM_DESC(enable_msi, "use an msi interrupt if available");
 
+#define dprintk(fmt, arg...)																					\
+	printk(KERN_DEBUG pr_fmt("%s:%d " fmt), __func__, __LINE__, ##arg)
+
 
 void tbsecp3_gpio_set_pin(struct tbsecp3_dev *dev,
 		struct tbsecp3_gpio_pin *pin, int state)
@@ -50,31 +53,18 @@ static irqreturn_t tbsecp3_irq_handler(int irq, void *dev_id)
 	struct tbsecp3_i2c *i2c;
 	int i, in;
 	u32 stat = tbs_read(TBSECP3_INT_BASE, TBSECP3_INT_STAT);
-
 	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_STAT, stat);
 
-	if (stat & 0x000000f0) {
-		/* dma0~3 */
+	if (stat & 0x00000ff0) {
+		/* dma0~7 */
 		for (i = 0; i < dev->info->adapters; i++) {
 			in = dev->adapter[i].cfg->ts_in;
-			if (stat & TBSECP3_DMA_IF(in)){
+			if (stat & TBSECP3_DMA_IF(in))
 				tasklet_schedule(&dev->adapter[i].tasklet);
-				}
 		}
 	}
-
-	if (stat & 0x00000f00) {
-		/* dma 4~7*/
-		for (i = 4; i < dev->info->adapters; i++) {
-			in = dev->adapter[i].cfg->ts_in;
-			if (stat & TBSECP3_DMA_IF(in)){
-				tasklet_schedule(&dev->adapter[i].tasklet);
-				}
-		}
-	}
-
-	if (stat & 0x000f0000) {
-		/* dma8~11 */
+	if (stat & 0x00ff0000) {
+		/* dma8~15 */
 		for (i = 8; i < dev->info->adapters; i++) {
 			in = dev->adapter[i].cfg->ts_in;
 			if (stat & TBSECP3_DMA_IF1(in)){
@@ -83,15 +73,6 @@ static irqreturn_t tbsecp3_irq_handler(int irq, void *dev_id)
 		}
 	}
 
-	if (stat & 0x00f00000) {
-		/* dma 12~15*/
-		for (i = 12; i < dev->info->adapters; i++) {
-			in = dev->adapter[i].cfg->ts_in;
-			if (stat & TBSECP3_DMA_IF1(in)){
-				tasklet_schedule(&dev->adapter[i].tasklet);
-				}
-		}
-	}
 
 	if (stat & 0x0000000f) {
 		/* i2c */
@@ -104,7 +85,6 @@ static irqreturn_t tbsecp3_irq_handler(int irq, void *dev_id)
 		}
 	}
 
-	//printk("tbsecp3_irq_handler stat 0x%x \n",stat);
 	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 1);
 	return IRQ_HANDLED;
 }
@@ -113,7 +93,12 @@ static int tbsecp3_adapters_attach(struct tbsecp3_dev *dev)
 {
 	int i, ret = 0;
 	for (i = 0; i < dev->info->adapters; i++) {
+
 		ret = tbsecp3_dvb_init(&dev->adapter[i]);
+		dprintk("adapter[%d]=%p tbs_nr=%d dvb_nr=%d q=%d\n", i, &dev->adapter[i],
+						dev->adapter[i].nr, dev->adapter[i].dvb_adapter.num, DVB_MAX_ADAPTERS);
+
+
 		if (ret) {
 			dev_err(&dev->pci_dev->dev,
 				"adapter%d attach failed\n",
@@ -131,7 +116,6 @@ static void tbsecp3_adapters_detach(struct tbsecp3_dev *dev)
 
 	for (i = 0; i < dev->info->adapters; i++) {
 		adapter = &dev->adapter[i];
-
 		/* attach has failed, nothing to do */
 		if (adapter->nr == -1)
 			continue;
@@ -150,6 +134,7 @@ static void tbsecp3_adapters_init(struct tbsecp3_dev *dev)
 		adapter->cfg = &dev->info->adap_config[i];
 		adapter->dev = dev;
 		adapter->i2c = &dev->i2c_bus[adapter->cfg->i2c_bus_nr];
+
 	}
 }
 
@@ -202,15 +187,15 @@ static int tbsecp3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct tbsecp3_dev *dev;
 	int ret = -ENODEV;
-
 	if (pci_enable_device(pdev) < 0)
 		return -ENODEV;
 
-	ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-	if (ret) {
-		dev_err(&pdev->dev, "32-bit PCI DMA not supported\n");
-		goto err0;
-	}
+	if(pci_set_dma_mask(pdev, DMA_BIT_MASK(64)))
+		if(pci_set_dma_mask(pdev, DMA_BIT_MASK(32)))
+		{
+			dev_err(&pdev->dev, "64/32-bit PCI DMA not supported\n");
+			goto err0;
+		}
 
 	pci_set_master(pdev);
 
@@ -222,7 +207,6 @@ static int tbsecp3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	dev->pci_dev = pdev;
 	pci_set_drvdata(pdev, dev);
-
 	dev->info = (struct tbsecp3_board *) id->driver_data;
 	dev_info(&pdev->dev, "%s\n", dev->info->name);
 
@@ -235,9 +219,7 @@ static int tbsecp3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 0);
 	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_STAT, 0xff);
-
 	tbsecp3_adapters_init(dev);
-
 	/* dma */
 	ret = tbsecp3_dma_init(dev);
 	if (ret < 0)
@@ -341,35 +323,53 @@ static const struct pci_device_id tbsecp3_id_table[] = {
 	TBSECP3_ID(TBSECP3_BOARD_TBS6205,0x6205,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6281SE,0x6281,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6290SE,0x6290,PCI_ANY_ID),
-	TBSECP3_ID(TBSECP3_BOARD_TBS6209,0x6209,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6209,0x6209,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6522,0x6522,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6528,0x6528,PCI_ANY_ID),
-	TBSECP3_ID(TBSECP3_BOARD_TBS6590,0x6590,PCI_ANY_ID),
-	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6590,0x6590,0x0001),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x1132),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0001),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0002),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0003),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6903,0x6903,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6904,0x6904,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6904,0x6904,0x1131),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6905,0x6905,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6908,0x6908,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6909,0x6909,0x0001),
-	TBSECP3_ID(TBSECP3_BOARD_TBS6910,0x6910,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6910,0x6910,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6704,0x6704,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6814,0x6814,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6514,0x6514,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS690a,0x690a,PCI_ANY_ID),
-	TBSECP3_ID(TBSECP3_BOARD_TBS6301,0x6301,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6301,0x6301,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6304,0x6304,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6308,0x6308,PCI_ANY_ID),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0010),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0009),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0019),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x0020),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x0021),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x8888),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6904X,0x6904,0x2000),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6912,0x6912,0x0020),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6504,0x6504,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6508,0x6508,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6916,0x6916,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6302SE,0x6302,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6302SE,0x6302,0x0001),
 	TBSECP3_ID(TBSECP3_BOARD_TBS6304,0x2605,PCI_ANY_ID),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6902SE,0x6902,0x0007),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6904SE,0x6904,0x0020),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6301,0x0005),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6302,0x0005),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6301,0x0004),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6910SE,0x6910,0x0006),
+	TBSECP3_ID(TBSECP3_BOARD_TBS7901,0x7901,0x0001),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6209SE,0x6209,0x0006),
+	TBSECP3_ID(TBSECP3_BOARD_TBS7901,0x7901,0x0001),
+	TBSECP3_ID(TBSECP3_BOARD_TBS7230,0x7230,0x0006),
+	TBSECP3_ID(TBSECP3_BOARD_TBS6302T,0x6302,0x0010),
 	{0}
 };
 MODULE_DEVICE_TABLE(pci, tbsecp3_id_table);

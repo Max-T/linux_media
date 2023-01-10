@@ -30,6 +30,10 @@
 #include <sound/ac97_codec.h>
 #include <media/v4l2-common.h>
 
+#define dprintk(fmt, arg...)																					\
+	printk(KERN_DEBUG pr_fmt("%s:%d " fmt),  __func__, __LINE__, ##arg)
+
+
 #define DRIVER_AUTHOR "Ludovico Cavedon <cavedon@sssup.it>, " \
 		      "Markus Rechberger <mrechberger@gmail.com>, " \
 		      "Mauro Carvalho Chehab <mchehab@kernel.org>, " \
@@ -89,7 +93,7 @@ int em28xx_read_reg_req_len(struct em28xx *dev, u8 req, u16 reg,
 	mutex_lock(&dev->ctrl_urb_lock);
 	ret = usb_control_msg(udev, pipe, req,
 			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      0x0000, reg, dev->urb_buf, len, HZ);
+			      0x0000, reg, dev->urb_buf, len, 1000);
 	if (ret < 0) {
 		em28xx_regdbg("(pipe 0x%08x): IN:  %02x %02x %02x %02x %02x %02x %02x %02x  failed with error %i\n",
 			      pipe,
@@ -158,7 +162,7 @@ int em28xx_write_regs_req(struct em28xx *dev, u8 req, u16 reg, char *buf,
 	memcpy(dev->urb_buf, buf, len);
 	ret = usb_control_msg(udev, pipe, req,
 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      0x0000, reg, dev->urb_buf, len, HZ);
+			      0x0000, reg, dev->urb_buf, len, 1000);
 	mutex_unlock(&dev->ctrl_urb_lock);
 
 	if (ret < 0) {
@@ -698,8 +702,10 @@ int em28xx_capture_start(struct em28xx *dev, int start)
 
 	if (dev->mode == EM28XX_ANALOG_MODE)
 		led = em28xx_find_led(dev, EM28XX_LED_ANALOG_CAPTURING);
-	else
+	else if (dev->ts == PRIMARY_TS)
 		led = em28xx_find_led(dev, EM28XX_LED_DIGITAL_CAPTURING);
+	else
+		led = em28xx_find_led(dev, EM28XX_LED_DIGITAL_CAPTURING_TS2);
 
 	if (led)
 		em28xx_write_reg_bits(dev, led->gpio_reg,
@@ -956,14 +962,10 @@ int em28xx_alloc_urbs(struct em28xx *dev, enum em28xx_mode mode, int xfer_bulk,
 
 		usb_bufs->buf[i] = kzalloc(sb_size, GFP_KERNEL);
 		if (!usb_bufs->buf[i]) {
-			em28xx_uninit_usb_xfer(dev, mode);
-
 			for (i--; i >= 0; i--)
 				kfree(usb_bufs->buf[i]);
 
-			kfree(usb_bufs->buf);
-			usb_bufs->buf = NULL;
-
+			em28xx_uninit_usb_xfer(dev, mode);
 			return -ENOMEM;
 		}
 
@@ -1108,10 +1110,13 @@ void em28xx_unregister_extension(struct em28xx_ops *ops)
 		if (ops->fini) {
 			if (dev->dev_next)
 				ops->fini(dev->dev_next);
-			ops->fini(dev);
+			if(ops && ops->fini)
+				ops->fini(dev);
+			dev->disconnected = true;
 		}
 	}
-	list_del(&ops->next);
+	if(!ops->next.next)
+		list_del(&ops->next);
 	mutex_unlock(&em28xx_devlist_mutex);
 	pr_info("em28xx: Removed (%s) extension\n", ops->name);
 }
@@ -1122,6 +1127,7 @@ void em28xx_init_extension(struct em28xx *dev)
 	const struct em28xx_ops *ops = NULL;
 
 	mutex_lock(&em28xx_devlist_mutex);
+	WARN_ON(dev->ts == SECONDARY_TS);
 	list_add_tail(&dev->devlist, &em28xx_devlist);
 	list_for_each_entry(ops, &em28xx_extension_devlist, next) {
 		if (ops->init) {
@@ -1135,7 +1141,10 @@ void em28xx_init_extension(struct em28xx *dev)
 
 void em28xx_close_extension(struct em28xx *dev)
 {
-	const struct em28xx_ops *ops = NULL;
+	struct em28xx_ops *ops = NULL;
+	WARN_ON(dev->disconnected);
+	if(dev->disconnected)
+		return;
 
 	mutex_lock(&em28xx_devlist_mutex);
 	list_for_each_entry(ops, &em28xx_extension_devlist, next) {
@@ -1145,7 +1154,9 @@ void em28xx_close_extension(struct em28xx *dev)
 			ops->fini(dev);
 		}
 	}
-	list_del(&dev->devlist);
+	if(dev->ts != SECONDARY_TS)
+		list_del(&dev->devlist);
+	dev->disconnected = 1;
 	mutex_unlock(&em28xx_devlist_mutex);
 }
 
@@ -1156,8 +1167,9 @@ int em28xx_suspend_extension(struct em28xx *dev)
 	dev_info(&dev->intf->dev, "Suspending extensions\n");
 	mutex_lock(&em28xx_devlist_mutex);
 	list_for_each_entry(ops, &em28xx_extension_devlist, next) {
-		if (ops->suspend)
-			ops->suspend(dev);
+		if (!ops->suspend)
+			continue;
+		ops->suspend(dev);
 		if (dev->dev_next)
 			ops->suspend(dev->dev_next);
 	}

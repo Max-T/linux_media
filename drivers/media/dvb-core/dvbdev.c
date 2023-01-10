@@ -1,20 +1,10 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 /*
  * dvbdev.c
  *
  * Copyright (C) 2000 Ralph  Metzler <ralph@convergence.de>
  *                  & Marcus Metzler <marcus@convergence.de>
  *                    for convergence integrated media GmbH
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public License
- * as published by the Free Software Foundation; either version 2.1
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) "dvbdev: " fmt
@@ -32,6 +22,8 @@
 #include <linux/cdev.h>
 #include <linux/mutex.h>
 #include <media/dvbdev.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 
 /* Due to enum tuner_pad_index */
 #include <media/tuner.h>
@@ -42,11 +34,8 @@ static int dvbdev_debug;
 module_param(dvbdev_debug, int, 0644);
 MODULE_PARM_DESC(dvbdev_debug, "Turn on/off device debugging (default:off).");
 
-#define dprintk(fmt, arg...) do {					\
-	if (dvbdev_debug)						\
-		printk(KERN_DEBUG pr_fmt("%s: " fmt),			\
-		       __func__, ##arg);				\
-} while (0)
+#define dprintk(fmt, arg...)							\
+	printk(KERN_DEBUG pr_fmt("%s:%d " fmt), __func__, __LINE__, ##arg)
 
 static LIST_HEAD(dvb_adapter_list);
 static DEFINE_MUTEX(dvbdev_register_lock);
@@ -241,6 +230,7 @@ static void dvb_media_device_free(struct dvb_device *dvbdev)
 
 	if (dvbdev->adapter->conn) {
 		media_device_unregister_entity(dvbdev->adapter->conn);
+		kfree(dvbdev->adapter->conn);
 		dvbdev->adapter->conn = NULL;
 		kfree(dvbdev->adapter->conn_pads);
 		dvbdev->adapter->conn_pads = NULL;
@@ -505,6 +495,7 @@ int dvb_register_device(struct dvb_adapter *adap, struct dvb_device **pdvbdev,
 			break;
 
 	if (minor == MAX_DVB_MINORS) {
+		list_del (&dvbdev->list_head);
 		kfree(dvbdevfops);
 		kfree(dvbdev);
 		up_write(&minor_rwsem);
@@ -525,6 +516,7 @@ int dvb_register_device(struct dvb_adapter *adap, struct dvb_device **pdvbdev,
 		      __func__);
 
 		dvb_media_device_free(dvbdev);
+		list_del (&dvbdev->list_head);
 		kfree(dvbdevfops);
 		kfree(dvbdev);
 		mutex_unlock(&dvbdev_register_lock);
@@ -539,11 +531,12 @@ int dvb_register_device(struct dvb_adapter *adap, struct dvb_device **pdvbdev,
 	if (IS_ERR(clsdev)) {
 		pr_err("%s: failed to create device dvb%d.%s%d (%ld)\n",
 		       __func__, adap->num, dnames[type], id, PTR_ERR(clsdev));
+		dvb_media_device_free(dvbdev);
+		list_del (&dvbdev->list_head);
+		kfree(dvbdevfops);
+		kfree(dvbdev);
 		return PTR_ERR(clsdev);
 	}
-	dprintk("DVB: register adapter%d/%s%d @ minor: %i (0x%02x)\n",
-		adap->num, dnames[type], id, minor, minor);
-
 	return 0;
 }
 EXPORT_SYMBOL(dvb_register_device);
@@ -707,9 +700,10 @@ int dvb_create_media_graph(struct dvb_adapter *adap,
 	}
 
 	if (ntuner && ndemod) {
-		pad_source = media_get_pad_index(tuner, true,
+		/* NOTE: first found tuner source pad presumed correct */
+		pad_source = media_get_pad_index(tuner, false,
 						 PAD_SIGNAL_ANALOG);
-		if (pad_source)
+		if (pad_source < 0)
 			return -EINVAL;
 		ret = media_create_pad_links(mdev,
 					     MEDIA_ENT_F_TUNER,
@@ -1029,11 +1023,50 @@ static char *dvb_devnode(struct device *dev, umode_t *mode)
 }
 
 
+static struct kobject *info_kobject;
+
+static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
+                      char *buf)
+{
+	/*
+		show() must not use snprintf() when formatting the value to be
+		returned to user space. If you can guarantee that an overflow
+		will never happen you can use sprintf() otherwise you must use
+		scnprintf().*/
+	return sprintf(buf,
+								 "type = \"neumo\";\n"
+								 "version = \"1.5\";\n");
+}
+
+static ssize_t version_store(struct kobject *kobj, struct kobj_attribute *attr,
+                      const char *buf, size_t count)
+{
+	return 0;
+}
+
+static struct kobj_attribute version_attribute =__ATTR(version, 0444, version_show, version_store);
+
+static int dvb_module_make_info(void)
+{
+	int error = 0;
+	struct kobject* mod_kobj = &(((struct module*)(THIS_MODULE))->mkobj).kobj;
+	info_kobject = kobject_create_and_add("info", mod_kobj/*kernel_kobj*/);
+	if(!info_kobject)
+		return -ENOMEM;
+
+	error = sysfs_create_file(info_kobject, &version_attribute.attr);
+	if (error) {
+		pr_err("dvb-core failed to create the info file\n");
+	}
+
+	return error;
+}
+
 static int __init init_dvbdev(void)
 {
 	int retval;
 	dev_t dev = MKDEV(DVB_MAJOR, 0);
-
+	dvb_module_make_info();
 	if ((retval = register_chrdev_region(dev, MAX_DVB_MINORS, "DVB")) != 0) {
 		pr_err("dvb-core: unable to get major %d\n", DVB_MAJOR);
 		return retval;
@@ -1053,7 +1086,6 @@ static int __init init_dvbdev(void)
 	dvb_class->dev_uevent = dvb_uevent;
 	dvb_class->devnode = dvb_devnode;
 	return 0;
-
 error:
 	cdev_del(&dvb_device_cdev);
 	unregister_chrdev_region(dev, MAX_DVB_MINORS);
@@ -1063,6 +1095,8 @@ error:
 
 static void __exit exit_dvbdev(void)
 {
+	if(info_kobject)
+		kobject_put(info_kobject);
 	class_destroy(dvb_class);
 	cdev_del(&dvb_device_cdev);
 	unregister_chrdev_region(MKDEV(DVB_MAJOR, 0), MAX_DVB_MINORS);

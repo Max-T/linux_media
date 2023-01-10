@@ -1,20 +1,10 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
 /*
  * dvb_demux.c - DVB kernel demux API
  *
  * Copyright (C) 2000-2001 Ralph  Metzler <ralph@convergence.de>
  *		       & Marcus Metzler <marcus@convergence.de>
  *			 for convergence integrated media GmbH
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public License
- * as published by the Free Software Foundation; either version 2.1
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) "dvb_demux: " fmt
@@ -468,11 +458,11 @@ static void dvb_dmx_swfilter_packet(struct dvb_demux *demux, const u8 *buf)
 					if(demux->cnt_storage[pid]==0xff) {
 						demux->cnt_storage[pid] = (buf[3] & 0xf);
 						//dprintk("INIT CNT PID=%d cnt=%d\n", pid, demux->cnt_storage[pid]);
-					}
-					else
+					} else {
 						demux->cnt_storage[pid] =
 							(demux->cnt_storage[pid] + 1) & 0xf;
-
+					}
+#if 0
 					if (buf[3] & 0x20) {//if packet has adaption field
 						int adaption_field_length= buf[4];
 						//bool possible_duplicate = ((buf[3] & 0xf) == demux->cnt_storage[pid]);
@@ -488,32 +478,30 @@ static void dvb_dmx_swfilter_packet(struct dvb_demux *demux, const u8 *buf)
 							}
 						}
 					}
+#endif
 				} else if(demux->cnt_storage[pid]==0xff) {
 					demux->cnt_storage[pid] = (buf[3] & 0xf);
 					//dprintk("INIT2 CNT PID=%d cnt=%d\n", pid, demux->cnt_storage[pid]);
 				}
 
 				if ((buf[3] & 0xf) != demux->cnt_storage[pid]) {
-					int listcount=0;
 					list_for_each_entry(feed, &demux->feed_list, list_head) {
-						listcount++;
 						if ((feed->pid != pid) && (feed->pid != 0x2000))
 							continue;
-#if 0
+#if 1
 						set_buf_flags(feed,
 													DMX_BUFFER_PKT_COUNTER_MISMATCH);
 #endif
 					}
-
-					dprintk_tscheck("TS packet counter mismatch. PID=%d expected 0x%x got 0x%x listcount=%d\n",
-							pid, demux->cnt_storage[pid],
-													buf[3] & 0xf, listcount);
+					dprintk_tscheck("TS packet counter mismatch. PID=%d expected 0x%x got 0x%x\n",
+													pid, demux->cnt_storage[pid],
+													buf[3] & 0xf);
 					demux->cnt_storage[pid] = buf[3] & 0xf;
 				}
 			}
 			/* end check */
 		}
-	ok__:
+ ok__:
 	list_for_each_entry(feed, &demux->feed_list, list_head) {
 		if ((feed->pid != pid) && (feed->pid != 0x2000))
 			continue;

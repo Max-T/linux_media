@@ -87,7 +87,7 @@ enum mpls_payload_type {
 };
 
 struct mpls_nh { /* next hop label forwarding entry */
-	struct net_device __rcu *nh_dev;
+	struct net_device	*nh_dev;
 
 	/* nh_flags is accessed under RCU in the packet path; it is
 	 * modified handling netdev events with rtnl lock held
@@ -171,17 +171,6 @@ struct mpls_route { /* next hop label forwarding entry */
 	     __nh += rt->rt_nh_size, nh = (struct mpls_nh *)__nh, nhsel++)
 
 #define endfor_nexthops(rt) }
-
-static inline struct mpls_shim_hdr mpls_entry_encode(u32 label, unsigned ttl, unsigned tc, bool bos)
-{
-	struct mpls_shim_hdr result;
-	result.label_stack_entry =
-		cpu_to_be32((label << MPLS_LS_LABEL_SHIFT) |
-			    (tc << MPLS_LS_TC_SHIFT) |
-			    (bos ? (1 << MPLS_LS_S_SHIFT) : 0) |
-			    (ttl << MPLS_LS_TTL_SHIFT));
-	return result;
-}
 
 static inline struct mpls_entry_decoded mpls_entry_decode(struct mpls_shim_hdr *hdr)
 {

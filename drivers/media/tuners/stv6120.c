@@ -44,7 +44,7 @@ struct SLookup {
 	u16 RegValue;
 };
 
-
+#if 0
 static int cutoff_from_index(int idx) {
 	if(idx==0)
 		return 5;
@@ -52,7 +52,7 @@ static int cutoff_from_index(int idx) {
 		return 36;
 	return 5+idx;
 }
-
+#endif
 static struct SLookup Gain_RFAGC_LookUp[] = {
 	/*Gain *100dB*/   /*reg*/
 	{	7429		,	0        },  /*	74.61 dB	weakest signal*/
@@ -208,6 +208,7 @@ static int i2c_write(struct i2c_adapter *adap, u8 adr, u8 *data, int len)
 	return 0;
 }
 
+#ifdef UNUSED
 static int write_regs(struct stv *state, int reg, int len)
 {
 	u8 d[8];
@@ -218,6 +219,7 @@ static int write_regs(struct stv *state, int reg, int len)
 	d[0] = reg;
 	return i2c_write(state->base->i2c, state->base->adr, d, len + 1);
 }
+#endif
 
 /*
 	write CTRL3 ... CTRL10

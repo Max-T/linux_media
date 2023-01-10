@@ -1,11 +1,4 @@
-.. Permission is granted to copy, distribute and/or modify this
-.. document under the terms of the GNU Free Documentation License,
-.. Version 1.1 or any later version published by the Free Software
-.. Foundation, with no Invariant Sections, no Front-Cover Texts
-.. and no Back-Cover Texts. A copy of the license is included at
-.. Documentation/userspace-api/media/fdl-appendix.rst.
-..
-.. TODO: replace it to GFDL-1.1-or-later WITH no-invariant-sections
+.. SPDX-License-Identifier: GFDL-1.1-no-invariants-or-later
 
 .. _camera-controls:
 
@@ -39,6 +32,7 @@ enum v4l2_exposure_auto_type -
     should ignore such requests. Possible values are:
 
 
+.. tabularcolumns:: |p{7.1cm}|p{10.4cm}|
 
 .. flat-table::
     :header-rows:  0
@@ -88,7 +82,7 @@ enum v4l2_exposure_metering -
     Determines how the camera measures the amount of light available for
     the frame exposure. Possible values are:
 
-.. tabularcolumns:: |p{8.7cm}|p{8.8cm}|
+.. tabularcolumns:: |p{8.7cm}|p{8.7cm}|
 
 .. flat-table::
     :header-rows:  0
@@ -180,7 +174,7 @@ enum v4l2_exposure_metering -
     control may stop updates of the ``V4L2_CID_AUTO_FOCUS_STATUS``
     control value.
 
-.. tabularcolumns:: |p{6.7cm}|p{10.8cm}|
+.. tabularcolumns:: |p{6.8cm}|p{10.7cm}|
 
 .. flat-table::
     :header-rows:  0
@@ -206,7 +200,7 @@ enum v4l2_exposure_metering -
 enum v4l2_auto_focus_range -
     Determines auto focus distance range for which lens may be adjusted.
 
-.. tabularcolumns:: |p{6.8cm}|p{10.7cm}|
+.. tabularcolumns:: |p{6.9cm}|p{10.6cm}|
 
 .. flat-table::
     :header-rows:  0
@@ -281,7 +275,7 @@ enum v4l2_auto_n_preset_white_balance -
     representation. The following white balance presets are listed in
     order of increasing color temperature.
 
-.. tabularcolumns:: |p{7.2 cm}|p{10.3cm}|
+.. tabularcolumns:: |p{7.4cm}|p{10.1cm}|
 
 .. flat-table::
     :header-rows:  0
@@ -391,7 +385,9 @@ enum v4l2_scene_mode -
 
     \small
 
-.. tabularcolumns:: |p{5.9cm}|p{11.5cm}|
+.. tabularcolumns:: |p{5.9cm}|p{11.6cm}|
+
+.. cssclass:: longtable
 
 .. flat-table::
     :header-rows:  0
@@ -509,6 +505,158 @@ enum v4l2_scene_mode -
     unit is undefined. A positive value moves the camera up, a negative
     value down. A value of zero stops the motion if one is in progress
     and has no effect otherwise.
+
+``V4L2_CID_CAMERA_ORIENTATION (menu)``
+    This read-only control describes the camera orientation by reporting its
+    mounting position on the device where the camera is installed. The control
+    value is constant and not modifiable by software. This control is
+    particularly meaningful for devices which have a well defined orientation,
+    such as phones, laptops and portable devices since the control is expressed
+    as a position relative to the device's intended usage orientation. For
+    example, a camera installed on the user-facing side of a phone, a tablet or
+    a laptop device is said to be have ``V4L2_CAMERA_ORIENTATION_FRONT``
+    orientation, while a camera installed on the opposite side of the front one
+    is said to be have ``V4L2_CAMERA_ORIENTATION_BACK`` orientation. Camera
+    sensors not directly attached to the device, or attached in a way that
+    allows them to move freely, such as webcams and digital cameras, are said to
+    have the ``V4L2_CAMERA_ORIENTATION_EXTERNAL`` orientation.
+
+
+.. tabularcolumns:: |p{7.7cm}|p{9.8cm}|
+
+.. flat-table::
+    :header-rows:  0
+    :stub-columns: 0
+
+    * - ``V4L2_CAMERA_ORIENTATION_FRONT``
+      - The camera is oriented towards the user facing side of the device.
+    * - ``V4L2_CAMERA_ORIENTATION_BACK``
+      - The camera is oriented towards the back facing side of the device.
+    * - ``V4L2_CAMERA_ORIENTATION_EXTERNAL``
+      - The camera is not directly attached to the device and is freely movable.
+
+
+
+``V4L2_CID_CAMERA_SENSOR_ROTATION (integer)``
+    This read-only control describes the rotation correction in degrees in the
+    counter-clockwise direction to be applied to the captured images once
+    captured to memory to compensate for the camera sensor mounting rotation.
+
+    For a precise definition of the sensor mounting rotation refer to the
+    extensive description of the 'rotation' properties in the device tree
+    bindings file 'video-interfaces.txt'.
+
+    A few examples are below reported, using a shark swimming from left to
+    right in front of the user as the example scene to capture. ::
+
+                 0               X-axis
+               0 +------------------------------------->
+                 !
+                 !
+                 !
+                 !           |\____)\___
+                 !           ) _____  __`<
+                 !           |/     )/
+                 !
+                 !
+                 !
+                 V
+               Y-axis
+
+    Example one - Webcam
+
+    Assuming you can bring your laptop with you while swimming with sharks,
+    the camera module of the laptop is installed on the user facing part of a
+    laptop screen casing, and is typically used for video calls. The captured
+    images are meant to be displayed in landscape mode (width > height) on the
+    laptop screen.
+
+    The camera is typically mounted upside-down to compensate the lens optical
+    inversion effect. In this case the value of the
+    V4L2_CID_CAMERA_SENSOR_ROTATION control is 0, no rotation is required to
+    display images correctly to the user.
+
+    If the camera sensor is not mounted upside-down it is required to compensate
+    the lens optical inversion effect and the value of the
+    V4L2_CID_CAMERA_SENSOR_ROTATION control is 180 degrees, as images will
+    result rotated when captured to memory. ::
+
+                 +--------------------------------------+
+                 !                                      !
+                 !                                      !
+                 !                                      !
+                 !              __/(_____/|             !
+                 !            >.___  ____ (             !
+                 !                 \(    \|             !
+                 !                                      !
+                 !                                      !
+                 !                                      !
+                 +--------------------------------------+
+
+    A software rotation correction of 180 degrees has to be applied to correctly
+    display the image on the user screen. ::
+
+                 +--------------------------------------+
+                 !                                      !
+                 !                                      !
+                 !                                      !
+                 !             |\____)\___              !
+                 !             ) _____  __`<            !
+                 !             |/     )/                !
+                 !                                      !
+                 !                                      !
+                 !                                      !
+                 +--------------------------------------+
+
+    Example two - Phone camera
+
+    It is more handy to go and swim with sharks with only your mobile phone
+    with you and take pictures with the camera that is installed on the back
+    side of the device, facing away from the user. The captured images are meant
+    to be displayed in portrait mode (height > width) to match the device screen
+    orientation and the device usage orientation used when taking the picture.
+
+    The camera sensor is typically mounted with its pixel array longer side
+    aligned to the device longer side, upside-down mounted to compensate for
+    the lens optical inversion effect.
+
+    The images once captured to memory will be rotated and the value of the
+    V4L2_CID_CAMERA_SENSOR_ROTATION will report a 90 degree rotation. ::
+
+
+                 +-------------------------------------+
+                 |                 _ _                 |
+                 |                \   /                |
+                 |                 | |                 |
+                 |                 | |                 |
+                 |                 |  >                |
+                 |                <  |                 |
+                 |                 | |                 |
+                 |                   .                 |
+                 |                  V                  |
+                 +-------------------------------------+
+
+    A correction of 90 degrees in counter-clockwise direction has to be
+    applied to correctly display the image in portrait mode on the device
+    screen. ::
+
+                          +--------------------+
+                          |                    |
+                          |                    |
+                          |                    |
+                          |                    |
+                          |                    |
+                          |                    |
+                          |   |\____)\___      |
+                          |   ) _____  __`<    |
+                          |   |/     )/        |
+                          |                    |
+                          |                    |
+                          |                    |
+                          |                    |
+                          |                    |
+                          +--------------------+
+
 
 .. [#f1]
    This control may be changed to a menu control in the future, if more

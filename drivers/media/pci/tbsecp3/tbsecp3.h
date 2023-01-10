@@ -65,13 +65,21 @@
 #define TBSECP3_BOARD_TBS6903X	21
 #define TBSECP3_BOARD_TBS6909X	22
 #define TBSECP3_BOARD_TBS6904X 	23
-#define TBSECP3_BOARD_TBS6912 		24
-#define TBSECP3_BOARD_TBS6504		25
+#define TBSECP3_BOARD_TBS6912 	24
+#define TBSECP3_BOARD_TBS6504	25
 #define TBSECP3_BOARD_TBS6508	26
-#define TBSECP3_BOARD_TBS6916	27
-#define TBSECP3_BOARD_TBS6302SE	28
-
+#define TBSECP3_BOARD_TBS6302SE	27
+#define TBSECP3_BOARD_TBS6902SE 28
+#define TBSECP3_BOARD_TBS6904SE 29
+#define TBSECP3_BOARD_TBS6301SE 30
+#define TBSECP3_BOARD_TBS6910SE 31
+#define TBSECP3_BOARD_TBS7901   32
+#define TBSECP3_BOARD_TBS6209SE 33
+#define TBSECP3_BOARD_TBS7230 34
+#define TBSECP3_BOARD_TBS6302T 35
+#define TBSECP3_BOARD_TBS6916	36
 #define TBSECP3_MAX_ADAPTERS	(16)
+
 #define TBSECP3_MAX_I2C_BUS	(4)
 
 #define TBSECP3_GPIODEF_NONE	(0)
@@ -97,7 +105,7 @@ struct tbsecp3_gpio_config {
 };
 
 struct tbsecp3_adap_config {
-        u32 ts_in;
+	u32 ts_in;
 	u8 i2c_bus_nr;
 	struct tbsecp3_gpio_config gpio;
 };
@@ -105,11 +113,12 @@ struct tbsecp3_adap_config {
 struct tbsecp3_board {
 	u16  board_id;
 	char *name;
+	char *short_name;
 	int adapters;
 	u32 i2c_speed;
 	u8 eeprom_i2c;
 	u8 eeprom_addr;
-	struct tbsecp3_adap_config adap_config[16];
+	struct tbsecp3_adap_config adap_config[TBSECP3_MAX_ADAPTERS];
 };
 
 struct tbsecp3_i2c {
@@ -195,7 +204,9 @@ struct tbsecp3_dev {
 
 	/* i2c */
 	struct tbsecp3_i2c i2c_bus[TBSECP3_MAX_I2C_BUS];
-
+	char card_address[64]; //string to uniquely identify the card on the system; typically dev_name(&dev->pci_dev->dev)
+	u64 adapter_mac_address;
+	u64 card_mac_address;
 	u8 mac_num;
 };
 

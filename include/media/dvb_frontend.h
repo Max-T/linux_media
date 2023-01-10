@@ -267,6 +267,13 @@ struct dvb_tuner_ops {
 	 * Don't use on newer drivers.
 	 */
 	int (*set_frequency)(struct dvb_frontend *fe, u32 frequency);
+
+	/*
+		set_bandwith should return:
+		 <0 on error
+		 effectively set bandwidth in case requested one cannot be satisfied
+		 older drivers might return 0 as "success"
+	 */
 	int (*set_bandwidth)(struct dvb_frontend *fe, u32 bandwidth);
 	int (*set_frequency_and_bandwidth)(struct dvb_frontend *fe, u32 frequency, u32 bandwidth);
 };
@@ -325,8 +332,8 @@ struct dtv_frontend_properties;
  * struct dvb_frontend_internal_info - Frontend properties and capabilities
  *
  * @name:			Name of the frontend
- * @dev_name:			Name of device to which frontend is attached
- * @card_name:			Name of card to which frontend is attached
+ * @dev_name:			Name of device to which frontend is attached - neumo
+ * @card_name:			Name of card to which frontend is attached - neumo
  * @adapter_name:			Name of adapter to which frontend is attached
  * @frequency_min_hz:		Minimal frequency supported by the frontend.
  * @frequency_max_hz:		Minimal frequency supported by the frontend.
@@ -342,11 +349,20 @@ struct dtv_frontend_properties;
  *				as specified in &enum fe_caps.
  */
 struct dvb_frontend_internal_info {
-	char	card_name[64];
+#if 1 //neumo - destroys binary compatibility
+	//char	card_name[64];
+	char	card_short_name[64];
 	char	adapter_name[64];
 	char	card_address[64];
 	char	adapter_address[64];
-	char	name[64];
+	int64_t card_mac_address;
+	uid_t owner_uid;
+	bool supports_neumo; //set to true if values if this driver supports neumo
+	s8 default_rf_input;
+	u8 num_rf_inputs;
+	s8 rf_inputs[16];
+#endif
+	char name[64]; //name of card
 	u32	frequency_min_hz;
 	u32	frequency_max_hz;
 	u32	frequency_stepsize_hz;
@@ -355,14 +371,18 @@ struct dvb_frontend_internal_info {
 	u32	symbol_rate_max;
 	u32	symbol_rate_tolerance;
 	enum fe_caps caps;
+#if 1 //neumo
 	enum fe_extended_caps extended_caps;
+#endif
 };
 
+#if 1 //neumo
 struct dvb_frame {
 	int frame_size;
 	int packet_size;
 	int sync_byte;
 };
+#endif
 
 /**
  * struct dvb_frontend_ops - Demodulation information and callbacks for
@@ -381,6 +401,10 @@ struct dvb_frame {
  *			allocated by the driver.
  * @init:		callback function used to initialize the tuner device.
  * @sleep:		callback function used to put the tuner to sleep.
+ * @suspend:		callback function used to inform that the Kernel will
+ *			suspend.
+ * @resume:		callback function used to inform that the Kernel is
+ *			resuming from suspend.
  * @write:		callback function used by some demod legacy drivers to
  *			allow other drivers to write data into their registers.
  *			Should not be used on new drivers.
@@ -455,13 +479,14 @@ struct dvb_frontend_ops {
 	struct dvb_frontend_internal_info info;
 
 	u8 delsys[MAX_DELSYS];
-
 	void (*detach)(struct dvb_frontend *fe);
 	void (*release)(struct dvb_frontend* fe);
 	void (*release_sec)(struct dvb_frontend* fe);
 
 	int (*init)(struct dvb_frontend* fe);
 	int (*sleep)(struct dvb_frontend* fe);
+	int (*suspend)(struct dvb_frontend *fe);
+	int (*resume)(struct dvb_frontend *fe);
 
 	int (*write)(struct dvb_frontend* fe, const u8 buf[], int len);
 
@@ -471,7 +496,7 @@ struct dvb_frontend_ops {
 		    unsigned int mode_flags,
 		    unsigned int *delay,
 		    enum fe_status *status);
-
+#if 1 //neumo - destroys binary compatibility with standard kernel
 	int (*stop_task)(struct dvb_frontend* fe);
 
 	int (*scan)(struct dvb_frontend* fe,
@@ -483,13 +508,9 @@ struct dvb_frontend_ops {
 
 	int (*spectrum_get)(struct dvb_frontend *fe,
 											struct dtv_fe_spectrum* user);
-
-	int (*constellation_start)(struct dvb_frontend *fe, struct dtv_fe_constellation* user,
-												unsigned int *delay, enum fe_status *status);
-
 	int (*constellation_get)(struct dvb_frontend *fe,
 											struct dtv_fe_constellation* user);
-
+#endif
 	/* get frontend tuning algorithm from the module */
 	enum dvbfe_algo (*get_frontend_algo)(struct dvb_frontend *fe);
 
@@ -514,6 +535,8 @@ struct dvb_frontend_ops {
 	int (*set_tone)(struct dvb_frontend *fe, enum fe_sec_tone_mode tone);
 	int (*set_voltage)(struct dvb_frontend *fe,
 			   enum fe_sec_voltage voltage);
+	int (*set_rf_input)(struct dvb_frontend *fe,
+			   s32 rf_input);
 	int (*enable_high_lnb_voltage)(struct dvb_frontend* fe, long arg);
 	int (*dishnetwork_send_legacy_command)(struct dvb_frontend* fe, unsigned long cmd);
 	int (*i2c_gate_ctrl)(struct dvb_frontend* fe, int enable);
@@ -531,9 +554,6 @@ struct dvb_frontend_ops {
 
 	int (*set_property)(struct dvb_frontend* fe, u32 cmd, u32 data);
 
-	int (*set_frame_ops)(struct dvb_frontend* fe, struct dvb_frame frame_ops);
-	int (*dtv_tune)(struct dvb_frontend* fe);
-
 	void(*spi_read)( struct dvb_frontend *fe,struct ecp3_info *ecp3inf);
 	void(*spi_write)( struct dvb_frontend *fe,struct ecp3_info *ecp3inf);
 
@@ -542,11 +562,15 @@ struct dvb_frontend_ops {
 
 	void(*reg_i2cread)( struct dvb_frontend *fe,struct usbi2c_access *pi2cinf);
 	void(*reg_i2cwrite)( struct dvb_frontend *fe,struct usbi2c_access *pi2cinf);
-
+#if 1 // TBS
+	void(*eeprom_read)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
+	void(*eeprom_write)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
+	int (*read_temp)(struct dvb_frontend* fe, s16* temp);
+#endif
 };
 
 #ifdef __DVB_CORE__
-#define MAX_EVENT 8
+#define MAX_EVENT 64
 
 /* Used only internally at dvb_frontend.c */
 struct dvb_fe_events {
@@ -637,8 +661,10 @@ struct dvb_fe_events {
  */
 struct dtv_frontend_properties {
 	u32			frequency;
+#if 1 //neumo
 	u32			search_range;
 	enum fe_algorithm algorithm;
+#endif
 	enum fe_modulation	modulation;
 
 	enum fe_sec_voltage	voltage;
@@ -650,7 +676,11 @@ struct dtv_frontend_properties {
 	enum fe_guard_interval	guard_interval;
 	enum fe_hierarchy	hierarchy;
 	u32			symbol_rate;
+#if 1 //neumo
 	u32			max_symbol_rate; //for sat search
+	s32     rf_in;
+	bool rf_in_valid; // to indicated if value has been set
+#endif
 	enum fe_code_rate	code_rate_HP;
 	enum fe_code_rate	code_rate_LP;
 
@@ -676,14 +706,22 @@ struct dtv_frontend_properties {
 	} layer[3];
 
 	/* Multistream specifics */
+#if 1  //TBS
 	bool    vcm; //1 if vcm else ccm
+#endif
 	u32			stream_id;
-	u32			matype;
+#if 1 // neumo
+	u16			matype_val;
+	u16     matype_valid;
 
-	u32			enable_modcod;
-	u32			frame_len;
+	u32			modcode;
 
-	/* Physical Layer Scrambling specifics */
+		/*for returning constellation samples*/
+
+	struct dtv_fe_constellation constellation;
+#endif
+
+    /* Physical Layer Scrambling specifics */
 	u32			scrambling_sequence_index;
 
 	/* ATSC-MH specifics */
@@ -705,12 +743,17 @@ struct dtv_frontend_properties {
 	u8			atscmh_sccc_code_mode_d;
 
 	u32			lna;
-	u8		isi[32];
-	u32		pls_search_codes[8];
+#if 1 //neumo
+	u32		isi_bitset[8];
+	u16		matypes[256];
+	int num_matypes;
+	u32		pls_search_codes[64];
 	u32		pls_search_range_start;
 	u32		pls_search_range_end;
-	u8		isi_list_len;
 	u8    pls_search_codes_len;
+	u32   bit_rate;
+	u32   locktime; //in ms
+#endif
 
 	/* statistics data */
 	struct dtv_fe_stats	strength;
@@ -721,12 +764,14 @@ struct dtv_frontend_properties {
 	struct dtv_fe_stats	post_bit_count;
 	struct dtv_fe_stats	block_error;
 	struct dtv_fe_stats	block_count;
-
+#if 1 //neumo
 	/* for satellite_search and get_spectrum */
 	s32 scan_start_frequency;
 	s32 scan_end_frequency;
 	s32 scan_resolution;
 	s32 scan_fft_size;
+	u8 plp_id;
+#endif
 };
 
 #define DVB_FE_NO_EXIT  0
@@ -734,12 +779,14 @@ struct dtv_frontend_properties {
 #define DVB_FE_DEVICE_REMOVED   2
 #define DVB_FE_DEVICE_RESUME    3
 
+#if 1 // neumo
 struct dtv_fe_algo_state {
 	atomic_t task_should_stop;
 	atomic_t cur_index; //used to measure progress; should be updated from time to time
 	atomic_t max_index; //when cur_inde==max_index task is done
 	wait_queue_head_t wait_queue;
 };
+#endif
 
 /**
  * struct dvb_frontend - Frontend structure to be used on drivers.
@@ -773,7 +820,9 @@ struct dvb_frontend {
 	void *sec_priv;
 	void *analog_demod_priv;
 	struct dtv_frontend_properties dtv_property_cache;
+#if 1 //neumo, destroys binary compatibility with standard kernel
 	struct dtv_fe_algo_state algo_state;
+#endif
 #define DVB_FRONTEND_COMPONENT_TUNER 0
 #define DVB_FRONTEND_COMPONENT_DEMOD 1
 	int (*callback)(void *adapter_priv, int component, int cmd, int arg);
@@ -836,7 +885,8 @@ void dvb_frontend_detach(struct dvb_frontend *fe);
  * &dvb_frontend_ops.tuner_ops.suspend\(\) is available, it calls it. Otherwise,
  * it will call &dvb_frontend_ops.tuner_ops.sleep\(\), if available.
  *
- * It will also call &dvb_frontend_ops.sleep\(\) to put the demod to suspend.
+ * It will also call &dvb_frontend_ops.suspend\(\) to put the demod to suspend,
+ * if available. Otherwise it will call &dvb_frontend_ops.sleep\(\).
  *
  * The drivers should also call dvb_frontend_suspend\(\) as part of their
  * handler for the &device_driver.suspend\(\).
@@ -850,7 +900,9 @@ int dvb_frontend_suspend(struct dvb_frontend *fe);
  *
  * This function resumes the usual operation of the tuner after resume.
  *
- * In order to resume the frontend, it calls the demod &dvb_frontend_ops.init\(\).
+ * In order to resume the frontend, it calls the demod
+ * &dvb_frontend_ops.resume\(\) if available. Otherwise it calls demod
+ * &dvb_frontend_ops.init\(\).
  *
  * If &dvb_frontend_ops.tuner_ops.resume\(\) is available, It, it calls it.
  * Otherwise,t will call &dvb_frontend_ops.tuner_ops.init\(\), if available.
@@ -902,5 +954,8 @@ void dvb_frontend_reinitialise(struct dvb_frontend *fe);
  * calling this function directly.
  */
 void dvb_frontend_sleep_until(ktime_t *waketime, u32 add_usec);
+#if 1 //neumo
 int dvb_frontend_task_should_stop(struct dvb_frontend *fe);
+#endif
+
 #endif

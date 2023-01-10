@@ -283,9 +283,11 @@ EXPORT_SYMBOL_GPL(imx_media_find_mbus_format);
  * @index: The requested match index.
  * @fmt_sel: Include in the enumeration entries with the given selection
  *           criteria.
+ * @code: If non-zero, only include in the enumeration entries matching this
+ *	media bus code.
  */
 int imx_media_enum_pixel_formats(u32 *fourcc, u32 index,
-				 enum imx_pixfmt_sel fmt_sel)
+				 enum imx_pixfmt_sel fmt_sel, u32 code)
 {
 	bool sel_ipu = fmt_sel & PIXFMT_SEL_IPU;
 	unsigned int i;
@@ -305,6 +307,25 @@ int imx_media_enum_pixel_formats(u32 *fourcc, u32 index,
 
 		if (!(fmt_sel & sel))
 			continue;
+
+		/*
+		 * If a media bus code is specified, only consider formats that
+		 * match it.
+		 */
+		if (code) {
+			unsigned int j;
+
+			if (!fmt->codes)
+				continue;
+
+			for (j = 0; fmt->codes[j]; j++) {
+				if (code == fmt->codes[j])
+					break;
+			}
+
+			if (!fmt->codes[j])
+				continue;
+		}
 
 		if (index == 0) {
 			*fourcc = fmt->fourcc;
@@ -408,7 +429,7 @@ EXPORT_SYMBOL_GPL(imx_media_init_mbus_fmt);
  * of a subdev. Can be used as the .init_cfg pad operation.
  */
 int imx_media_init_cfg(struct v4l2_subdev *sd,
-		       struct v4l2_subdev_pad_config *cfg)
+		       struct v4l2_subdev_state *sd_state)
 {
 	struct v4l2_mbus_framefmt *mf_try;
 	struct v4l2_subdev_format format;
@@ -424,7 +445,7 @@ int imx_media_init_cfg(struct v4l2_subdev *sd,
 		if (ret)
 			continue;
 
-		mf_try = v4l2_subdev_get_try_format(sd, cfg, pad);
+		mf_try = v4l2_subdev_get_try_format(sd, sd_state, pad);
 		*mf_try = format.format;
 	}
 
@@ -547,48 +568,6 @@ int imx_media_mbus_fmt_to_pix_fmt(struct v4l2_pix_format *pix,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(imx_media_mbus_fmt_to_pix_fmt);
-
-int imx_media_mbus_fmt_to_ipu_image(struct ipu_image *image,
-				    const struct v4l2_mbus_framefmt *mbus)
-{
-	int ret;
-
-	memset(image, 0, sizeof(*image));
-
-	ret = imx_media_mbus_fmt_to_pix_fmt(&image->pix, mbus, NULL);
-	if (ret)
-		return ret;
-
-	image->rect.width = mbus->width;
-	image->rect.height = mbus->height;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(imx_media_mbus_fmt_to_ipu_image);
-
-int imx_media_ipu_image_to_mbus_fmt(struct v4l2_mbus_framefmt *mbus,
-				    const struct ipu_image *image)
-{
-	const struct imx_media_pixfmt *fmt;
-
-	fmt = imx_media_find_pixel_format(image->pix.pixelformat,
-					  PIXFMT_SEL_ANY);
-	if (!fmt || !fmt->codes || !fmt->codes[0])
-		return -EINVAL;
-
-	memset(mbus, 0, sizeof(*mbus));
-	mbus->width = image->pix.width;
-	mbus->height = image->pix.height;
-	mbus->code = fmt->codes[0];
-	mbus->field = image->pix.field;
-	mbus->colorspace = image->pix.colorspace;
-	mbus->xfer_func = image->pix.xfer_func;
-	mbus->ycbcr_enc = image->pix.ycbcr_enc;
-	mbus->quantization = image->pix.quantization;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(imx_media_ipu_image_to_mbus_fmt);
 
 void imx_media_free_dma_buf(struct device *dev,
 			    struct imx_media_dma_buf *buf)
@@ -833,6 +812,39 @@ imx_media_pipeline_video_device(struct media_entity *start_entity,
 	return media_entity_to_video_device(me);
 }
 EXPORT_SYMBOL_GPL(imx_media_pipeline_video_device);
+
+/*
+ * Find a fwnode endpoint that maps to the given subdevice's pad.
+ * If there are multiple endpoints that map to the pad, only the
+ * first endpoint encountered is returned.
+ *
+ * On success the refcount of the returned fwnode endpoint is
+ * incremented.
+ */
+struct fwnode_handle *imx_media_get_pad_fwnode(struct media_pad *pad)
+{
+	struct fwnode_handle *endpoint;
+	struct v4l2_subdev *sd;
+
+	if (!is_media_entity_v4l2_subdev(pad->entity))
+		return ERR_PTR(-ENODEV);
+
+	sd = media_entity_to_v4l2_subdev(pad->entity);
+
+	fwnode_graph_for_each_endpoint(dev_fwnode(sd->dev), endpoint) {
+		int pad_idx = media_entity_get_fwnode_pad(&sd->entity,
+							  endpoint,
+							  pad->flags);
+		if (pad_idx < 0)
+			continue;
+
+		if (pad_idx == pad->index)
+			return endpoint;
+	}
+
+	return ERR_PTR(-ENODEV);
+}
+EXPORT_SYMBOL_GPL(imx_media_get_pad_fwnode);
 
 /*
  * Turn current pipeline streaming on/off starting from entity.

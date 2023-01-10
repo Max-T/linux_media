@@ -8,6 +8,8 @@ config CEC_NOTIFIER
 config CEC_PIN
 	bool
 
+menu "CEC support"
+
 config MEDIA_CEC_RC
 	bool "HDMI CEC RC integration"
 	depends on CEC_CORE && RC_CORE
@@ -24,7 +26,7 @@ config CEC_PIN_ERROR_INJ
 menuconfig MEDIA_CEC_SUPPORT
 	bool
 	prompt "HDMI CEC drivers"
-	default y if !MEDIA_SUPPORT_FILTER
+	default y if MEDIA_SUPPORT && !MEDIA_SUPPORT_FILTER
 	help
 	  Enable support for HDMI CEC (Consumer Electronics Control),
 	  which is an optional HDMI feature.
@@ -33,6 +35,9 @@ menuconfig MEDIA_CEC_SUPPORT
 	  adapter that supports HDMI CEC.
 
 if MEDIA_CEC_SUPPORT
+source "drivers/media/cec/i2c/Kconfig"
 source "drivers/media/cec/platform/Kconfig"
 source "drivers/media/cec/usb/Kconfig"
 endif
+
+endmenu

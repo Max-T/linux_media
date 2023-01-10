@@ -15,7 +15,11 @@ description: |-
 
 properties:
   compatible:
-    const: rockchip,rk3399-vdec
+    oneOf:
+      - const: rockchip,rk3399-vdec
+      - items:
+          - const: rockchip,rk3228-vdec
+          - const: rockchip,rk3399-vdec
 
   reg:
     maxItems: 1
@@ -36,6 +40,10 @@ properties:
       - const: ahb
       - const: cabac
       - const: core
+
+  assigned-clocks: true
+
+  assigned-clock-rates: true
 
   power-domains:
     maxItems: 1
@@ -61,7 +69,7 @@ examples:
 
     vdec: video-codec@ff660000 {
         compatible = "rockchip,rk3399-vdec";
-        reg = <0x0 0xff660000 0x0 0x400>;
+        reg = <0xff660000 0x400>;
         interrupts = <GIC_SPI 116 IRQ_TYPE_LEVEL_HIGH 0>;
         clocks = <&cru ACLK_VDU>, <&cru HCLK_VDU>,
                  <&cru SCLK_VDU_CA>, <&cru SCLK_VDU_CORE>;
