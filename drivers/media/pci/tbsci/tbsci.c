@@ -29,6 +29,15 @@
 DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 struct workqueue_struct *wq;
 
+static bool enable_msi = true;
+module_param(enable_msi, bool, 0444);
+MODULE_PARM_DESC(enable_msi, "use an msi interrupt if available");
+
+static int write_block_cell = 64;
+module_param(write_block_cell, int, 0444);
+MODULE_PARM_DESC(
+	write_block_cell,
+	" Controls the number of irq generated. 96 - x86, 80 or lower on arm64");
 
 static void start_outdma_transfer(struct ca_channel *pchannel)
 {
@@ -39,8 +48,7 @@ static void start_outdma_transfer(struct ca_channel *pchannel)
 		speedctrl =div_u64(1000000000ULL * WRITE_TOTAL_SIZE,(pchannel->w_bitrate )*1024*1024 );
 		TBS_PCIE_WRITE(dmaout_adapter0+pchannel->channel_index*0x1000, DMA_SPEED_CTRL, (speedctrl));
 		TBS_PCIE_WRITE(dmaout_adapter0+pchannel->channel_index*0x1000, DMA_INT_MONITOR, (2*speedctrl));
-		speedctrl = div_u64(speedctrl , WRITE_BLOCK_CEEL);
-		//speedctrl = div_u64(speedctrl*9 , WRITE_BLOCK_CEEL*10);
+		speedctrl = div_u64(speedctrl, write_block_cell);
 		TBS_PCIE_WRITE(dmaout_adapter0+pchannel->channel_index*0x1000, DMA_FRAME_CNT, (speedctrl));
 	}
 
@@ -124,7 +132,8 @@ static ssize_t ts_write(struct file *file, const char __user *ptr,
 		unsigned int ret;
 		ret = kfifo_from_user(&chan->w_fifo, ptr, size, &copied);
 		if (size != copied)
-			printk("%s size:%u  %u\n", __func__, size, copied);
+			printk("%s write size:%lu  %u\n", __func__, size,
+			       copied);
 	}
 
 	return size;
@@ -138,8 +147,9 @@ static ssize_t ts_read(struct file *file, char __user *ptr,
 	struct dvb_device *dvbdev = file->private_data;
 	struct ca_channel *chan = dvbdev->priv;
 	int count;
+	unsigned int copied = -EAGAIN;
 
-//	printk("%s channel index:%d \n",__func__,  chan->channel_index);
+	//	printk("%s channel index:%d \n",__func__,  chan->channel_index);
 	count = kfifo_len(&chan->r_fifo); 
 	while (count < TS_PACKET_SIZE)
 	{
@@ -151,7 +161,7 @@ static ssize_t ts_read(struct file *file, char __user *ptr,
 			break;
 		count = kfifo_len(&chan->r_fifo);
 	}
-	unsigned int copied = -EAGAIN;
+
 	if (count > size)
 		count = size;
 	if (count >= TS_PACKET_SIZE && kfifo_to_user(&chan->r_fifo, ptr, count, &copied))
@@ -190,6 +200,8 @@ static int ts_open(struct inode *inode, struct file *filp)
 		start_outdma_transfer(chan);
 		start_indma_transfer(chan);
 	}
+	if ((filp->f_flags & O_ACCMODE) == O_RDONLY)
+		chan->is_open_for_read = 1;
 	chan->is_open++;
 
 	return ret;
@@ -206,14 +218,18 @@ static int ts_release(struct inode *inode, struct file *file)
 		stop_indma_transfer(chan);
 		stop_outdma_transfer(chan);
 	}
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		chan->is_open_for_read = 0;
+
 	return dvb_generic_release(inode,file);
 }
 
 
 void spi_read(struct tbs_pcie_dev *dev, struct mcu24cxx_info *info)
 {
+	//	printk("%s bassaddr:%x ,reg: %x,val: %x\n", __func__,
+	//	       info->bassaddr, info->reg, info->data);
 	info->data = TBS_PCIE_READ(info->bassaddr, info->reg);
-	//printk("%s bassaddr:%x ,reg: %x,val: %x\n", __func__, info->bassaddr, info->reg,info->data);
 }
 void spi_write(struct tbs_pcie_dev *dev, struct mcu24cxx_info *info)
 {
@@ -242,7 +258,9 @@ static long tbsci_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			switch (prop.cmd)
 			{
 				case MODULATOR_INPUT_BITRATE:
-					printk("%s ca%d:INPUT_BITRATE:%d\n", __func__,chan->channel_index,prop.u.data);
+					printk("%s ca%d:INPUT_BITRATE:%d\n",
+					       __func__, chan->channel_index,
+					       prop.u.data);
 					chan->w_bitrate = prop.u.data;
 					//set clock preset 
 					
@@ -295,7 +313,6 @@ static long tbsci_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		ret = -EINVAL;
 		break;
 	}
-
 	return ret;
 
 }
@@ -340,7 +357,7 @@ static void write_dma_work(struct work_struct *p_work)
 	}
 	else{
 		delay = div_u64(1000000000ULL * WRITE_TOTAL_SIZE, (pchannel->w_bitrate )*1024*1024*3);
-		//printk("%s bitrate %d,0x18 delayshort: %d \n", __func__,pchannel->w_bitrate,delay);
+		//	printk("%s bitrate %d,0x18 delayshort: %d \n", __func__,pchannel->w_bitrate,delay);
 		TBS_PCIE_WRITE(dmaout_adapter0+pchannel->channel_index*0x1000, DMA_DELAYSHORT, (delay));
 		//TBS_PCIE_WRITE(int_adapter, 0x04, 0x00000001);
 	}
@@ -349,20 +366,35 @@ static void write_dma_work(struct work_struct *p_work)
 }
 
 // Drop the empty packets
-static int copy_non_null_ts_to_kfifo(struct kfifo *r_fifo, void *source, int size) {
+static int copy_non_null_ts(struct ca_channel *pchannel, void *source, int size)
+{
 	int i, len = 0;
 	uint8_t *src = (uint8_t *)source;
+	int copied = 0;
+	int dropped = 0;
+	int count = kfifo_avail(&pchannel->r_fifo);
+
 	for (i = 0; i < size; i += TS_PACKET_SIZE) {
 		int pid = (src[i + 1] & 0x1F) * 256 + src[i + 2];
 		if (pid < 0x1FFF) {
-			int copied = kfifo_in(r_fifo, src + i,
-				 TS_PACKET_SIZE);
-			if (copied < 0) {
-				return copied;
+			if (pchannel->is_open_for_read) {
+				if (count >= TS_PACKET_SIZE) {
+					copied = kfifo_in(&pchannel->r_fifo,
+							  src + i,
+							  TS_PACKET_SIZE);
+					count -= copied;
+				} else
+					dropped++;
+			}
+			if (pchannel->feeds) {
+				dvb_dmx_swfilter_packets(&pchannel->demux,
+							 src + i, 1);
 			}
 			len += copied;
 		}
 	}
+	if (dropped > 0)
+		printk("%s dropped: %d packets\n", __func__, dropped);
 	return len;
 }
 
@@ -370,7 +402,6 @@ static void read_dma_work(struct work_struct *p_work)
 {
 	struct ca_channel *pchannel = container_of(p_work, struct ca_channel, read_work);
 	struct tbs_pcie_dev *dev = pchannel->dev;
-	int count = 0;
 	u32 read_buffer, next_buffer;
 	int ret=0;
 	u8 * data;
@@ -409,22 +440,12 @@ static void read_dma_work(struct work_struct *p_work)
 				}
 			}
 
+			ret = copy_non_null_ts(pchannel,
+					       data + pchannel->dma_offset,
+					       READ_CELL_SIZE);
+			pchannel->read_ready = 1;
+			wake_up(&pchannel->read_wq);
 
-			count = kfifo_avail(&pchannel->r_fifo); 
-			if (count >= READ_CELL_SIZE){
-				ret = copy_non_null_ts_to_kfifo(
-					&pchannel->r_fifo,
-					data + pchannel->dma_offset,
-					READ_CELL_SIZE);
-				pchannel->read_ready = 1;
-				wake_up(&pchannel->read_wq);	
-
-			}
-			if(pchannel->feeds){
-				//printk("%s feeds:%d\n",__func__,pchannel->feeds);
-				dvb_dmx_swfilter_packets(&pchannel->demux,data+pchannel->dma_offset,READ_PKTS);
-				
-			}
 			read_buffer = (read_buffer + 1) & (READ_CELLS - 1);
 		}
 		pchannel->next_buffer = (u8)next_buffer;
@@ -876,11 +897,11 @@ static void tbs_adapters_remove(struct tbs_pcie_dev *dev)
 		kfifo_free(&tbsca->w_fifo);
 		kfifo_free(&tbsca->r_fifo);
 		if (!tbsca->w_dmavirt){
-			pci_free_consistent(dev->pdev, DMASIZE, tbsca->w_dmavirt, tbsca->w_dmaphy);
+			dma_free_coherent(&dev->pdev->dev, DMASIZE, tbsca->w_dmavirt, tbsca->w_dmaphy);
 			tbsca->w_dmavirt = NULL;
 		}
 		if (!tbsca->r_dmavirt){
-			pci_free_consistent(dev->pdev, DMASIZE, tbsca->r_dmavirt, tbsca->r_dmaphy);
+			dma_free_coherent(&dev->pdev->dev, DMASIZE, tbsca->r_dmavirt, tbsca->r_dmaphy);
 			tbsca->r_dmavirt = NULL;
 		}
 	//	tasklet_kill(&tbsca->tasklet);
@@ -913,16 +934,16 @@ static int tbs_adapters_init(struct tbs_pcie_dev *dev)
 
 	for(i=0;i<CHANNELS;i++){
 		tbsca = &dev->channnel[i];
-		tbsca->w_dmavirt = pci_alloc_consistent(dev->pdev, DMASIZE, &tbsca->w_dmaphy);
+		tbsca->w_dmavirt = dma_alloc_coherent(&dev->pdev->dev, DMASIZE, &tbsca->w_dmaphy, GFP_KERNEL);
 		if (!tbsca->w_dmavirt)
 		{
-			printk(" allocate write memory failed\n");
+			printk("allocate write DMA  memory failed, set coherent_pool=4M or higher\n");
 			goto fail;
 		}
-		tbsca->r_dmavirt = pci_alloc_consistent(dev->pdev, DMASIZE, &tbsca->r_dmaphy);
+		tbsca->r_dmavirt = dma_alloc_coherent(&dev->pdev->dev, DMASIZE, &tbsca->r_dmaphy, GFP_KERNEL);
 		if (!tbsca->r_dmavirt)
 		{
-			printk(" allocate read memory failed\n");
+			printk("allocate read DMA memory failed, set coherent_pool=4M or higher\n");
 			goto fail;
 		}
 		tbsca->channel_index=i;
@@ -1021,6 +1042,10 @@ static void tbsci_remove(struct pci_dev *pdev)
 
 	/* disable interrupts */
 	free_irq(dev->pdev->irq, dev);
+	if (dev->msi) {
+		pci_disable_msi(pdev);
+		dev->msi = false;
+	}
 
 	if (dev->mmio)
 		iounmap(dev->mmio);
@@ -1028,6 +1053,38 @@ static void tbsci_remove(struct pci_dev *pdev)
 	kfree(dev);
 	pci_disable_device(pdev);
 	pci_set_drvdata(pdev, NULL);
+}
+
+static bool tbsci_enable_msi(struct pci_dev *pdev, struct tbs_pcie_dev *dev)
+{
+	int err;
+
+	if (!enable_msi) {
+		dev_warn(&dev->pdev->dev,
+			"MSI disabled by module parameter 'enable_msi'\n");
+		return false;
+	}
+
+	err = pci_enable_msi(pdev);
+	if (err) {
+		dev_err(&dev->pdev->dev,
+			"Failed to enable MSI interrupt."
+			" Falling back to a shared IRQ\n");
+		return false;
+	}
+
+	/* no error - so request an msi interrupt */
+	err = request_irq(pdev->irq, tbsci_irq, 0,
+				KBUILD_MODNAME, dev);
+	if (err) {
+		/* fall back to legacy interrupt */
+		dev_err(&dev->pdev->dev,
+			"Failed to get an MSI interrupt."
+			" Falling back to a shared IRQ\n");
+		pci_disable_msi(pdev);
+		return false;
+	}
+	return true;
 }
 
 
@@ -1064,14 +1121,6 @@ static int tbsci_probe(struct pci_dev *pdev,
 		goto fail2;
 	}
 
-	ret = request_irq(dev->pdev->irq, tbsci_irq, IRQF_SHARED, KBUILD_MODNAME, (void *)dev);
-	if (ret < 0)
-	{
-		printk("%s ERROR: IRQ registration failed <%d>\n", __func__, ret);
-		ret = -ENODEV;
-		goto fail2;
-	}
-
 	pci_set_drvdata(pdev, dev);
 			
 	ret = tbs_adapters_init(dev);
@@ -1079,14 +1128,33 @@ static int tbsci_probe(struct pci_dev *pdev,
 	{
 		printk("%s ERROR: tbs_adapters_init <%d>\n", __func__, ret);
 		ret = -ENODEV;
-		goto fail3;
+		goto fail2;
 	}
 
+	//interrupts 
+	if (tbsci_enable_msi(pdev, dev)) {
+		printk("KBUILD_MODNAME : %s --MSI!\n",KBUILD_MODNAME);
+		dev->msi = true;
+	} else {
+		printk("KBUILD_MODNAME : %s --INTx\n\n",KBUILD_MODNAME);
+		ret = request_irq(pdev->irq, tbsci_irq,
+				IRQF_SHARED, KBUILD_MODNAME, dev);
+		if (ret < 0) {
+			printk(KERN_ERR "%s ERROR: IRQ registration failed <%d>\n", __func__, ret);
+			ret = -ENODEV;
+			goto fail3;
+		}
+		dev->msi = false;
+	}
 
 	return 0;
 
 fail3:
 	free_irq(dev->pdev->irq, dev);
+	if (dev->msi) {
+		pci_disable_msi(pdev);
+		dev->msi = false;
+	}
 	if (dev->mmio)
 		iounmap(dev->mmio);
 fail2:

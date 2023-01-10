@@ -35,8 +35,13 @@
  */
 #define HVC_RESET_VECTORS 2
 
+/*
+ * HVC_VHE_RESTART - Upgrade the CPU from EL1 to EL2, if possible
+ */
+#define HVC_VHE_RESTART	3
+
 /* Max number of HYP stub hypercalls */
-#define HVC_STUB_HCALL_NR 3
+#define HVC_STUB_HCALL_NR 4
 
 /* Error returned when an invalid stub number is passed into x0 */
 #define HVC_STUB_ERR	0xbadca11
@@ -61,6 +66,8 @@
  * This allows the kernel to flag an error when the secondaries have come up.
  */
 extern u32 __boot_cpu_mode[2];
+
+#define ARM64_VECTOR_TABLE_LEN	SZ_2K
 
 void __hyp_set_vectors(phys_addr_t phys_vector_base);
 void __hyp_reset_vectors(void);
@@ -121,6 +128,11 @@ static __always_inline bool is_protected_kvm_enabled(void)
 		return false;
 	else
 		return cpus_have_final_cap(ARM64_KVM_PROTECTED_MODE);
+}
+
+static inline bool is_hyp_nvhe(void)
+{
+	return is_hyp_mode_available() && !is_kernel_in_hyp_mode();
 }
 
 #endif /* __ASSEMBLY__ */

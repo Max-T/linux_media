@@ -70,7 +70,7 @@ enum {
 };
 
 /**
- * struct ale_dev_id - The ALE version/SoC specific configuration
+ * struct cpsw_ale_dev_id - The ALE version/SoC specific configuration
  * @dev_id: ALE version/SoC id
  * @features: features supported by ALE
  * @tbl_entries: number of ALE entries
@@ -1256,6 +1256,13 @@ static const struct cpsw_ale_dev_id cpsw_ale_id_match[] = {
 		.major_ver_mask = 0x7,
 		.vlan_entry_tbl = vlan_entry_k3_cpswxg,
 	},
+	{
+		.dev_id = "am64-cpswxg",
+		.features = CPSW_ALE_F_STATUS_REG | CPSW_ALE_F_HW_AUTOAGING,
+		.major_ver_mask = 0x7,
+		.vlan_entry_tbl = vlan_entry_k3_cpswxg,
+		.tbl_entries = 512,
+	},
 	{ },
 };
 
@@ -1292,10 +1299,8 @@ struct cpsw_ale *cpsw_ale_create(struct cpsw_ale_params *params)
 	if (!ale)
 		return ERR_PTR(-ENOMEM);
 
-	ale->p0_untag_vid_mask =
-		devm_kmalloc_array(params->dev, BITS_TO_LONGS(VLAN_N_VID),
-				   sizeof(unsigned long),
-				   GFP_KERNEL);
+	ale->p0_untag_vid_mask = devm_bitmap_zalloc(params->dev, VLAN_N_VID,
+						    GFP_KERNEL);
 	if (!ale->p0_untag_vid_mask)
 		return ERR_PTR(-ENOMEM);
 

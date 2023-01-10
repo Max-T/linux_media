@@ -62,7 +62,6 @@
 
 #define SKL_FLIP_EVENT(pipe, plane) (PRIMARY_A_FLIP_DONE + (plane) * 3 + (pipe))
 
-#define PLANE_CTL_ASYNC_FLIP		(1 << 9)
 #define REG50080_FLIP_TYPE_MASK	0x3
 #define REG50080_FLIP_TYPE_ASYNC	0x1
 
@@ -133,4 +132,6 @@
 #define RING_GFX_MODE(base)	_MMIO((base) + 0x29c)
 #define VF_GUARDBAND		_MMIO(0x83a4)
 
+
+#define BCS_TILE_REGISTER_VAL_OFFSET (0x43*4)
 #endif

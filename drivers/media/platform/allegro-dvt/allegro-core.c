@@ -6,16 +6,20 @@
  */
 
 #include <linux/bits.h>
+#include <linux/clk.h>
 #include <linux/firmware.h>
 #include <linux/gcd.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/log2.h>
+#include <linux/mfd/syscon.h>
+#include <linux/mfd/syscon/xlnx-vcu.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -30,6 +34,7 @@
 
 #include "allegro-mail.h"
 #include "nal-h264.h"
+#include "nal-hevc.h"
 
 /*
  * Support up to 4k video streams. The hardware actually supports higher
@@ -90,9 +95,21 @@
  * because it needs to write SPS/PPS NAL units. The encoder writes the actual
  * frame data after the offset.
  */
-#define ENCODER_STREAM_OFFSET SZ_64
+#define ENCODER_STREAM_OFFSET SZ_128
 
 #define SIZE_MACROBLOCK 16
+
+/* Encoding options */
+#define LOG2_MAX_FRAME_NUM		4
+#define LOG2_MAX_PIC_ORDER_CNT		10
+#define BETA_OFFSET_DIV_2		-1
+#define TC_OFFSET_DIV_2			-1
+
+/*
+ * This control allows applications to explicitly disable the encoder buffer.
+ * This value is Allegro specific.
+ */
+#define V4L2_CID_USER_ALLEGRO_ENCODER_BUFFER (V4L2_CID_USER_ALLEGRO_BASE + 0)
 
 static int debug;
 module_param(debug, int, 0644);
@@ -118,6 +135,13 @@ struct allegro_mbox {
 	struct mutex lock;
 };
 
+struct allegro_encoder_buffer {
+	unsigned int size;
+	unsigned int color_depth;
+	unsigned int num_cores;
+	unsigned int clk_rate;
+};
+
 struct allegro_dev {
 	struct v4l2_device v4l2_dev;
 	struct video_device video_dev;
@@ -129,12 +153,19 @@ struct allegro_dev {
 
 	struct regmap *regmap;
 	struct regmap *sram;
+	struct regmap *settings;
+
+	struct clk *clk_core;
+	struct clk *clk_mcu;
 
 	const struct fw_info *fw_info;
 	struct allegro_buffer firmware;
 	struct allegro_buffer suballocator;
+	bool has_encoder_buffer;
+	struct allegro_encoder_buffer encoder_buffer;
 
 	struct completion init_complete;
+	bool initialized;
 
 	/* The mailbox interface */
 	struct allegro_mbox *mbox_command;
@@ -189,21 +220,40 @@ struct allegro_channel {
 	unsigned int osequence;
 
 	u32 codec;
-	enum v4l2_mpeg_video_h264_profile profile;
-	enum v4l2_mpeg_video_h264_level level;
 	unsigned int sizeimage_encoded;
 	unsigned int csequence;
 
 	bool frame_rc_enable;
 	unsigned int bitrate;
 	unsigned int bitrate_peak;
-	unsigned int cpb_size;
-	unsigned int gop_size;
 
 	struct allegro_buffer config_blob;
 
+	unsigned int log2_max_frame_num;
+	bool temporal_mvp_enable;
+
+	bool enable_loop_filter_across_tiles;
+	bool enable_loop_filter_across_slices;
+	bool enable_deblocking_filter_override;
+	bool enable_reordering;
+	bool dbf_ovr_en;
+
 	unsigned int num_ref_idx_l0;
 	unsigned int num_ref_idx_l1;
+
+	/* Maximum range for motion estimation */
+	int b_hrz_me_range;
+	int b_vrt_me_range;
+	int p_hrz_me_range;
+	int p_vrt_me_range;
+	/* Size limits of coding unit */
+	int min_cu_size;
+	int max_cu_size;
+	/* Size limits of transform unit */
+	int min_tu_size;
+	int max_tu_size;
+	int max_transfo_depth_intra;
+	int max_transfo_depth_inter;
 
 	struct v4l2_ctrl *mpeg_video_h264_profile;
 	struct v4l2_ctrl *mpeg_video_h264_level;
@@ -212,6 +262,16 @@ struct allegro_channel {
 	struct v4l2_ctrl *mpeg_video_h264_min_qp;
 	struct v4l2_ctrl *mpeg_video_h264_p_frame_qp;
 	struct v4l2_ctrl *mpeg_video_h264_b_frame_qp;
+
+	struct v4l2_ctrl *mpeg_video_hevc_profile;
+	struct v4l2_ctrl *mpeg_video_hevc_level;
+	struct v4l2_ctrl *mpeg_video_hevc_tier;
+	struct v4l2_ctrl *mpeg_video_hevc_i_frame_qp;
+	struct v4l2_ctrl *mpeg_video_hevc_max_qp;
+	struct v4l2_ctrl *mpeg_video_hevc_min_qp;
+	struct v4l2_ctrl *mpeg_video_hevc_p_frame_qp;
+	struct v4l2_ctrl *mpeg_video_hevc_b_frame_qp;
+
 	struct v4l2_ctrl *mpeg_video_frame_rc_enable;
 	struct { /* video bitrate mode control cluster */
 		struct v4l2_ctrl *mpeg_video_bitrate_mode;
@@ -220,6 +280,8 @@ struct allegro_channel {
 	};
 	struct v4l2_ctrl *mpeg_video_cpb_size;
 	struct v4l2_ctrl *mpeg_video_gop_size;
+
+	struct v4l2_ctrl *encoder_buffer;
 
 	/* user_id is used to identify the channel during CREATE_CHANNEL */
 	/* not sure, what to set here and if this is actually required */
@@ -240,6 +302,51 @@ struct allegro_channel {
 
 	unsigned int error;
 };
+
+static inline int
+allegro_channel_get_i_frame_qp(struct allegro_channel *channel)
+{
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_i_frame_qp);
+	else
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_i_frame_qp);
+}
+
+static inline int
+allegro_channel_get_p_frame_qp(struct allegro_channel *channel)
+{
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_p_frame_qp);
+	else
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_p_frame_qp);
+}
+
+static inline int
+allegro_channel_get_b_frame_qp(struct allegro_channel *channel)
+{
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_b_frame_qp);
+	else
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_b_frame_qp);
+}
+
+static inline int
+allegro_channel_get_min_qp(struct allegro_channel *channel)
+{
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_min_qp);
+	else
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_min_qp);
+}
+
+static inline int
+allegro_channel_get_max_qp(struct allegro_channel *channel)
+{
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_max_qp);
+	else
+		return v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_max_qp);
+}
 
 struct allegro_m2m_buffer {
 	struct v4l2_m2m_buffer buf;
@@ -454,7 +561,7 @@ select_minimum_h264_level(unsigned int width, unsigned int height)
 	return level;
 }
 
-static unsigned int maximum_bitrate(enum v4l2_mpeg_video_h264_level level)
+static unsigned int h264_maximum_bitrate(enum v4l2_mpeg_video_h264_level level)
 {
 	switch (level) {
 	case V4L2_MPEG_VIDEO_H264_LEVEL_1_0:
@@ -493,7 +600,7 @@ static unsigned int maximum_bitrate(enum v4l2_mpeg_video_h264_level level)
 	}
 }
 
-static unsigned int maximum_cpb_size(enum v4l2_mpeg_video_h264_level level)
+static unsigned int h264_maximum_cpb_size(enum v4l2_mpeg_video_h264_level level)
 {
 	switch (level) {
 	case V4L2_MPEG_VIDEO_H264_LEVEL_1_0:
@@ -529,6 +636,86 @@ static unsigned int maximum_cpb_size(enum v4l2_mpeg_video_h264_level level)
 	case V4L2_MPEG_VIDEO_H264_LEVEL_5_1:
 	default:
 		return 240000;
+	}
+}
+
+static enum v4l2_mpeg_video_hevc_level
+select_minimum_hevc_level(unsigned int width, unsigned int height)
+{
+	unsigned int luma_picture_size = width * height;
+	enum v4l2_mpeg_video_hevc_level level;
+
+	if (luma_picture_size <= 36864)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_1;
+	else if (luma_picture_size <= 122880)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_2;
+	else if (luma_picture_size <= 245760)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_2_1;
+	else if (luma_picture_size <= 552960)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_3;
+	else if (luma_picture_size <= 983040)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_3_1;
+	else if (luma_picture_size <= 2228224)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_4;
+	else if (luma_picture_size <= 8912896)
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_5;
+	else
+		level = V4L2_MPEG_VIDEO_HEVC_LEVEL_6;
+
+	return level;
+}
+
+static unsigned int hevc_maximum_bitrate(enum v4l2_mpeg_video_hevc_level level)
+{
+	/*
+	 * See Rec. ITU-T H.265 v5 (02/2018), A.4.2 Profile-specific level
+	 * limits for the video profiles.
+	 */
+	switch (level) {
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_1:
+		return 128;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2:
+		return 1500;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2_1:
+		return 3000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3:
+		return 6000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3_1:
+		return 10000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4:
+		return 12000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1:
+		return 20000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5:
+		return 25000;
+	default:
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1:
+		return 40000;
+	}
+}
+
+static unsigned int hevc_maximum_cpb_size(enum v4l2_mpeg_video_hevc_level level)
+{
+	switch (level) {
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_1:
+		return 350;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2:
+		return 1500;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2_1:
+		return 3000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3:
+		return 6000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3_1:
+		return 10000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4:
+		return 12000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1:
+		return 20000;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5:
+		return 25000;
+	default:
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1:
+		return 40000;
 	}
 }
 
@@ -760,6 +947,52 @@ out:
 	kfree(msg);
 }
 
+static int allegro_encoder_buffer_init(struct allegro_dev *dev,
+				       struct allegro_encoder_buffer *buffer)
+{
+	int err;
+	struct regmap *settings = dev->settings;
+	unsigned int supports_10_bit;
+	unsigned int memory_depth;
+	unsigned int num_cores;
+	unsigned int color_depth;
+	unsigned long clk_rate;
+
+	/* We don't support the encoder buffer pre Firmware version 2019.2 */
+	if (dev->fw_info->mailbox_version < MCU_MSG_VERSION_2019_2)
+		return -ENODEV;
+
+	if (!settings)
+		return -EINVAL;
+
+	err = regmap_read(settings, VCU_ENC_COLOR_DEPTH, &supports_10_bit);
+	if (err < 0)
+		return err;
+	err = regmap_read(settings, VCU_MEMORY_DEPTH, &memory_depth);
+	if (err < 0)
+		return err;
+	err = regmap_read(settings, VCU_NUM_CORE, &num_cores);
+	if (err < 0)
+		return err;
+
+	clk_rate = clk_get_rate(dev->clk_core);
+	if (clk_rate == 0)
+		return -EINVAL;
+
+	color_depth = supports_10_bit ? 10 : 8;
+	/* The firmware expects the encoder buffer size in bits. */
+	buffer->size = color_depth * 32 * memory_depth;
+	buffer->color_depth = color_depth;
+	buffer->num_cores = num_cores;
+	buffer->clk_rate = clk_rate;
+
+	v4l2_dbg(1, debug, &dev->v4l2_dev,
+		 "using %d bits encoder buffer with %d-bit color depth\n",
+		 buffer->size, color_depth);
+
+	return 0;
+}
+
 static void allegro_mcu_send_init(struct allegro_dev *dev,
 				  dma_addr_t suballoc_dma, size_t suballoc_size)
 {
@@ -773,10 +1006,17 @@ static void allegro_mcu_send_init(struct allegro_dev *dev,
 	msg.suballoc_dma = to_mcu_addr(dev, suballoc_dma);
 	msg.suballoc_size = to_mcu_size(dev, suballoc_size);
 
-	/* disable L2 cache */
-	msg.l2_cache[0] = -1;
-	msg.l2_cache[1] = -1;
-	msg.l2_cache[2] = -1;
+	if (dev->has_encoder_buffer) {
+		msg.encoder_buffer_size = dev->encoder_buffer.size;
+		msg.encoder_buffer_color_depth = dev->encoder_buffer.color_depth;
+		msg.num_cores = dev->encoder_buffer.num_cores;
+		msg.clk_rate = dev->encoder_buffer.clk_rate;
+	} else {
+		msg.encoder_buffer_size = -1;
+		msg.encoder_buffer_color_depth = -1;
+		msg.num_cores = -1;
+		msg.clk_rate = -1;
+	}
 
 	allegro_mbox_send(dev->mbox_command, &msg);
 }
@@ -855,6 +1095,55 @@ static u16 v4l2_level_to_mcu_level(enum v4l2_mpeg_video_h264_level level)
 	}
 }
 
+static u8 hevc_profile_to_mcu_profile(enum v4l2_mpeg_video_hevc_profile profile)
+{
+	switch (profile) {
+	default:
+	case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN:
+		return 1;
+	case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10:
+		return 2;
+	case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE:
+		return 3;
+	}
+}
+
+static u16 hevc_level_to_mcu_level(enum v4l2_mpeg_video_hevc_level level)
+{
+	switch (level) {
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_1:
+		return 10;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2:
+		return 20;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_2_1:
+		return 21;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3:
+		return 30;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_3_1:
+		return 31;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4:
+		return 40;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1:
+		return 41;
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5:
+		return 50;
+	default:
+	case V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1:
+		return 51;
+	}
+}
+
+static u8 hevc_tier_to_mcu_tier(enum v4l2_mpeg_video_hevc_tier tier)
+{
+	switch (tier) {
+	default:
+	case V4L2_MPEG_VIDEO_HEVC_TIER_MAIN:
+		return 0;
+	case V4L2_MPEG_VIDEO_HEVC_TIER_HIGH:
+		return 1;
+	}
+}
+
 static u32
 v4l2_bitrate_mode_to_mcu_mode(enum v4l2_mpeg_video_bitrate_mode mode)
 {
@@ -891,13 +1180,26 @@ static s16 get_qp_delta(int minuend, int subtrahend)
 		return minuend - subtrahend;
 }
 
+static u32 allegro_channel_get_entropy_mode(struct allegro_channel *channel)
+{
+#define ALLEGRO_ENTROPY_MODE_CAVLC 0
+#define ALLEGRO_ENTROPY_MODE_CABAC 1
+
+	/* HEVC always uses CABAC, but this has to be explicitly set */
+	if (channel->codec == V4L2_PIX_FMT_HEVC)
+		return ALLEGRO_ENTROPY_MODE_CABAC;
+
+	return ALLEGRO_ENTROPY_MODE_CAVLC;
+}
+
 static int fill_create_channel_param(struct allegro_channel *channel,
 				     struct create_channel_param *param)
 {
-	int i_frame_qp = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_i_frame_qp);
-	int p_frame_qp = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_p_frame_qp);
-	int b_frame_qp = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_b_frame_qp);
+	int i_frame_qp = allegro_channel_get_i_frame_qp(channel);
+	int p_frame_qp = allegro_channel_get_p_frame_qp(channel);
+	int b_frame_qp = allegro_channel_get_b_frame_qp(channel);
 	int bitrate_mode = v4l2_ctrl_g_ctrl(channel->mpeg_video_bitrate_mode);
+	unsigned int cpb_size = v4l2_ctrl_g_ctrl(channel->mpeg_video_cpb_size);
 
 	param->width = channel->width;
 	param->height = channel->height;
@@ -905,48 +1207,69 @@ static int fill_create_channel_param(struct allegro_channel *channel,
 	param->colorspace =
 		v4l2_colorspace_to_mcu_colorspace(channel->colorspace);
 	param->src_mode = 0x0;
-	param->profile = v4l2_profile_to_mcu_profile(channel->profile);
-	param->constraint_set_flags = BIT(1);
+
 	param->codec = channel->codec;
-	param->level = v4l2_level_to_mcu_level(channel->level);
-	param->tier = 0;
+	if (channel->codec == V4L2_PIX_FMT_H264) {
+		enum v4l2_mpeg_video_h264_profile profile;
+		enum v4l2_mpeg_video_h264_level level;
 
-	param->log2_max_poc = 10;
-	param->log2_max_frame_num = 4;
-	param->temporal_mvp_enable = 1;
+		profile = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_profile);
+		level = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_level);
 
-	param->dbf_ovr_en = 1;
+		param->profile = v4l2_profile_to_mcu_profile(profile);
+		param->constraint_set_flags = BIT(1);
+		param->level = v4l2_level_to_mcu_level(level);
+	} else {
+		enum v4l2_mpeg_video_hevc_profile profile;
+		enum v4l2_mpeg_video_hevc_level level;
+		enum v4l2_mpeg_video_hevc_tier tier;
+
+		profile = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_profile);
+		level = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_level);
+		tier = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_tier);
+
+		param->profile = hevc_profile_to_mcu_profile(profile);
+		param->level = hevc_level_to_mcu_level(level);
+		param->tier = hevc_tier_to_mcu_tier(tier);
+	}
+
+	param->log2_max_poc = LOG2_MAX_PIC_ORDER_CNT;
+	param->log2_max_frame_num = channel->log2_max_frame_num;
+	param->temporal_mvp_enable = channel->temporal_mvp_enable;
+
+	param->dbf_ovr_en = channel->dbf_ovr_en;
+	param->override_lf = channel->enable_deblocking_filter_override;
+	param->enable_reordering = channel->enable_reordering;
+	param->entropy_mode = allegro_channel_get_entropy_mode(channel);
 	param->rdo_cost_mode = 1;
 	param->custom_lda = 1;
 	param->lf = 1;
-	param->lf_x_tile = 1;
-	param->lf_x_slice = 1;
+	param->lf_x_tile = channel->enable_loop_filter_across_tiles;
+	param->lf_x_slice = channel->enable_loop_filter_across_slices;
 
 	param->src_bit_depth = 8;
 
-	param->beta_offset = -1;
-	param->tc_offset = -1;
+	param->beta_offset = BETA_OFFSET_DIV_2;
+	param->tc_offset = TC_OFFSET_DIV_2;
 	param->num_slices = 1;
-	param->me_range[0] = 8;
-	param->me_range[1] = 8;
-	param->me_range[2] = 16;
-	param->me_range[3] = 16;
-	param->max_cu_size = ilog2(SIZE_MACROBLOCK);
-	param->min_cu_size = ilog2(8);
-	param->max_tu_size = 2;
-	param->min_tu_size = 2;
-	param->max_transfo_depth_intra = 1;
-	param->max_transfo_depth_inter = 1;
+	param->me_range[0] = channel->b_hrz_me_range;
+	param->me_range[1] = channel->b_vrt_me_range;
+	param->me_range[2] = channel->p_hrz_me_range;
+	param->me_range[3] = channel->p_vrt_me_range;
+	param->max_cu_size = channel->max_cu_size;
+	param->min_cu_size = channel->min_cu_size;
+	param->max_tu_size = channel->max_tu_size;
+	param->min_tu_size = channel->min_tu_size;
+	param->max_transfo_depth_intra = channel->max_transfo_depth_intra;
+	param->max_transfo_depth_inter = channel->max_transfo_depth_inter;
 
-	param->prefetch_auto = 0;
-	param->prefetch_mem_offset = 0;
-	param->prefetch_mem_size = 0;
+	param->encoder_buffer_enabled = v4l2_ctrl_g_ctrl(channel->encoder_buffer);
+	param->encoder_buffer_offset = 0;
 
 	param->rate_control_mode = channel->frame_rc_enable ?
 		v4l2_bitrate_mode_to_mcu_mode(bitrate_mode) : 0;
 
-	param->cpb_size = v4l2_cpb_size_to_mcu(channel->cpb_size,
-					       channel->bitrate_peak);
+	param->cpb_size = v4l2_cpb_size_to_mcu(cpb_size, channel->bitrate_peak);
 	/* Shall be ]0;cpb_size in 90 kHz units]. Use maximum value. */
 	param->initial_rem_delay = param->cpb_size;
 	param->framerate = DIV_ROUND_UP(channel->framerate.numerator,
@@ -955,8 +1278,8 @@ static int fill_create_channel_param(struct allegro_channel *channel,
 	param->target_bitrate = channel->bitrate;
 	param->max_bitrate = channel->bitrate_peak;
 	param->initial_qp = i_frame_qp;
-	param->min_qp = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_min_qp);
-	param->max_qp = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_max_qp);
+	param->min_qp = allegro_channel_get_min_qp(channel);
+	param->max_qp = allegro_channel_get_max_qp(channel);
 	param->ip_delta = get_qp_delta(i_frame_qp, p_frame_qp);
 	param->pb_delta = get_qp_delta(p_frame_qp, b_frame_qp);
 	param->golden_ref = 0;
@@ -969,10 +1292,10 @@ static int fill_create_channel_param(struct allegro_channel *channel,
 	param->max_pixel_value = 255;
 
 	param->gop_ctrl_mode = 0x00000002;
-	param->freq_idr = channel->gop_size;
+	param->freq_idr = v4l2_ctrl_g_ctrl(channel->mpeg_video_gop_size);
 	param->freq_lt = 0;
 	param->gdr_mode = 0x00000000;
-	param->gop_length = channel->gop_size;
+	param->gop_length = v4l2_ctrl_g_ctrl(channel->mpeg_video_gop_size);
 	param->subframe_latency = 0x00000000;
 
 	param->lda_factors[0] = 51;
@@ -1066,6 +1389,7 @@ static int allegro_mcu_send_encode_frame(struct allegro_dev *dev,
 					 u64 src_handle)
 {
 	struct mcu_msg_encode_frame msg;
+	bool use_encoder_buffer = v4l2_ctrl_g_ctrl(channel->encoder_buffer);
 
 	memset(&msg, 0, sizeof(msg));
 
@@ -1074,6 +1398,8 @@ static int allegro_mcu_send_encode_frame(struct allegro_dev *dev,
 
 	msg.channel_id = channel->mcu_channel_id;
 	msg.encoding_options = AL_OPT_FORCE_LOAD;
+	if (use_encoder_buffer)
+		msg.encoding_options |= AL_OPT_USE_L2;
 	msg.pps_qp = 26; /* qp are relative to 26 */
 	msg.user_param = 0; /* copied to mcu_msg_encode_frame_response */
 	/* src_handle is copied to mcu_msg_encode_frame_response */
@@ -1081,8 +1407,6 @@ static int allegro_mcu_send_encode_frame(struct allegro_dev *dev,
 	msg.src_y = to_codec_addr(dev, src_y);
 	msg.src_uv = to_codec_addr(dev, src_uv);
 	msg.stride = channel->stride;
-	msg.ep2 = 0x0;
-	msg.ep2_v = to_mcu_addr(dev, msg.ep2);
 
 	allegro_mbox_send(dev->mbox_command, &msg);
 
@@ -1252,23 +1576,30 @@ static ssize_t allegro_h264_write_sps(struct allegro_channel *channel,
 	/* Calculation of crop units in Rec. ITU-T H.264 (04/2017) p. 76 */
 	unsigned int crop_unit_x = 2;
 	unsigned int crop_unit_y = 2;
+	enum v4l2_mpeg_video_h264_profile profile;
+	enum v4l2_mpeg_video_h264_level level;
+	unsigned int cpb_size;
+	unsigned int cpb_size_scale;
 
 	sps = kzalloc(sizeof(*sps), GFP_KERNEL);
 	if (!sps)
 		return -ENOMEM;
 
-	sps->profile_idc = nal_h264_profile_from_v4l2(channel->profile);
+	profile = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_profile);
+	level = v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_level);
+
+	sps->profile_idc = nal_h264_profile(profile);
 	sps->constraint_set0_flag = 0;
 	sps->constraint_set1_flag = 1;
 	sps->constraint_set2_flag = 0;
 	sps->constraint_set3_flag = 0;
 	sps->constraint_set4_flag = 0;
 	sps->constraint_set5_flag = 0;
-	sps->level_idc = nal_h264_level_from_v4l2(channel->level);
+	sps->level_idc = nal_h264_level(level);
 	sps->seq_parameter_set_id = 0;
-	sps->log2_max_frame_num_minus4 = 0;
+	sps->log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
 	sps->pic_order_cnt_type = 0;
-	sps->log2_max_pic_order_cnt_lsb_minus4 = 6;
+	sps->log2_max_pic_order_cnt_lsb_minus4 = LOG2_MAX_PIC_ORDER_CNT - 4;
 	sps->max_num_ref_frames = 3;
 	sps->gaps_in_frame_num_value_allowed_flag = 0;
 	sps->pic_width_in_mbs_minus1 =
@@ -1289,13 +1620,17 @@ static ssize_t allegro_h264_write_sps(struct allegro_channel *channel,
 	sps->vui_parameters_present_flag = 1;
 	sps->vui.aspect_ratio_info_present_flag = 0;
 	sps->vui.overscan_info_present_flag = 0;
+
 	sps->vui.video_signal_type_present_flag = 1;
-	sps->vui.video_format = 1;
-	sps->vui.video_full_range_flag = 0;
+	sps->vui.video_format = 5; /* unspecified */
+	sps->vui.video_full_range_flag = nal_h264_full_range(channel->quantization);
 	sps->vui.colour_description_present_flag = 1;
-	sps->vui.colour_primaries = 5;
-	sps->vui.transfer_characteristics = 5;
-	sps->vui.matrix_coefficients = 5;
+	sps->vui.colour_primaries = nal_h264_color_primaries(channel->colorspace);
+	sps->vui.transfer_characteristics =
+		nal_h264_transfer_characteristics(channel->colorspace, channel->xfer_func);
+	sps->vui.matrix_coefficients =
+		nal_h264_matrix_coeffs(channel->colorspace, channel->ycbcr_enc);
+
 	sps->vui.chroma_loc_info_present_flag = 1;
 	sps->vui.chroma_sample_loc_type_top_field = 0;
 	sps->vui.chroma_sample_loc_type_bottom_field = 0;
@@ -1308,14 +1643,17 @@ static ssize_t allegro_h264_write_sps(struct allegro_channel *channel,
 	sps->vui.nal_hrd_parameters_present_flag = 0;
 	sps->vui.vcl_hrd_parameters_present_flag = 1;
 	sps->vui.vcl_hrd_parameters.cpb_cnt_minus1 = 0;
-	sps->vui.vcl_hrd_parameters.bit_rate_scale = 0;
-	sps->vui.vcl_hrd_parameters.cpb_size_scale = 1;
 	/* See Rec. ITU-T H.264 (04/2017) p. 410 E-53 */
+	sps->vui.vcl_hrd_parameters.bit_rate_scale =
+		ffs(channel->bitrate_peak) - 6;
 	sps->vui.vcl_hrd_parameters.bit_rate_value_minus1[0] =
 		channel->bitrate_peak / (1 << (6 + sps->vui.vcl_hrd_parameters.bit_rate_scale)) - 1;
 	/* See Rec. ITU-T H.264 (04/2017) p. 410 E-54 */
+	cpb_size = v4l2_ctrl_g_ctrl(channel->mpeg_video_cpb_size);
+	cpb_size_scale = ffs(cpb_size) - 4;
+	sps->vui.vcl_hrd_parameters.cpb_size_scale = cpb_size_scale;
 	sps->vui.vcl_hrd_parameters.cpb_size_value_minus1[0] =
-		(channel->cpb_size * 1000) / (1 << (4 + sps->vui.vcl_hrd_parameters.cpb_size_scale)) - 1;
+		(cpb_size * 1000) / (1 << (4 + cpb_size_scale)) - 1;
 	sps->vui.vcl_hrd_parameters.cbr_flag[0] =
 		!v4l2_ctrl_g_ctrl(channel->mpeg_video_frame_rc_enable);
 	sps->vui.vcl_hrd_parameters.initial_cpb_removal_delay_length_minus1 = 31;
@@ -1377,6 +1715,205 @@ static void allegro_channel_eos_event(struct allegro_channel *channel)
 	};
 
 	v4l2_event_queue_fh(&channel->fh, &eos_event);
+}
+
+static ssize_t allegro_hevc_write_vps(struct allegro_channel *channel,
+				      void *dest, size_t n)
+{
+	struct allegro_dev *dev = channel->dev;
+	struct nal_hevc_vps *vps;
+	struct nal_hevc_profile_tier_level *ptl;
+	ssize_t size;
+	unsigned int num_ref_frames = channel->num_ref_idx_l0;
+	s32 profile = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_profile);
+	s32 level = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_level);
+	s32 tier = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_tier);
+
+	vps = kzalloc(sizeof(*vps), GFP_KERNEL);
+	if (!vps)
+		return -ENOMEM;
+
+	vps->base_layer_internal_flag = 1;
+	vps->base_layer_available_flag = 1;
+	vps->temporal_id_nesting_flag = 1;
+
+	ptl = &vps->profile_tier_level;
+	ptl->general_profile_idc = nal_hevc_profile(profile);
+	ptl->general_profile_compatibility_flag[ptl->general_profile_idc] = 1;
+	ptl->general_tier_flag = nal_hevc_tier(tier);
+	ptl->general_progressive_source_flag = 1;
+	ptl->general_frame_only_constraint_flag = 1;
+	ptl->general_level_idc = nal_hevc_level(level);
+
+	vps->sub_layer_ordering_info_present_flag = 0;
+	vps->max_dec_pic_buffering_minus1[0] = num_ref_frames;
+	vps->max_num_reorder_pics[0] = num_ref_frames;
+
+	size = nal_hevc_write_vps(&dev->plat_dev->dev, dest, n, vps);
+
+	kfree(vps);
+
+	return size;
+}
+
+static ssize_t allegro_hevc_write_sps(struct allegro_channel *channel,
+				      void *dest, size_t n)
+{
+	struct allegro_dev *dev = channel->dev;
+	struct nal_hevc_sps *sps;
+	struct nal_hevc_profile_tier_level *ptl;
+	struct nal_hevc_vui_parameters *vui;
+	struct nal_hevc_hrd_parameters *hrd;
+	ssize_t size;
+	unsigned int cpb_size;
+	unsigned int num_ref_frames = channel->num_ref_idx_l0;
+	s32 profile = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_profile);
+	s32 level = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_level);
+	s32 tier = v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_tier);
+
+	sps = kzalloc(sizeof(*sps), GFP_KERNEL);
+	if (!sps)
+		return -ENOMEM;
+
+	sps->temporal_id_nesting_flag = 1;
+
+	ptl = &sps->profile_tier_level;
+	ptl->general_profile_idc = nal_hevc_profile(profile);
+	ptl->general_profile_compatibility_flag[ptl->general_profile_idc] = 1;
+	ptl->general_tier_flag = nal_hevc_tier(tier);
+	ptl->general_progressive_source_flag = 1;
+	ptl->general_frame_only_constraint_flag = 1;
+	ptl->general_level_idc = nal_hevc_level(level);
+
+	sps->seq_parameter_set_id = 0;
+	sps->chroma_format_idc = 1; /* Only 4:2:0 sampling supported */
+	sps->pic_width_in_luma_samples = round_up(channel->width, 8);
+	sps->pic_height_in_luma_samples = round_up(channel->height, 8);
+	sps->conf_win_right_offset =
+		sps->pic_width_in_luma_samples - channel->width;
+	sps->conf_win_bottom_offset =
+		sps->pic_height_in_luma_samples - channel->height;
+	sps->conformance_window_flag =
+		sps->conf_win_right_offset || sps->conf_win_bottom_offset;
+
+	sps->log2_max_pic_order_cnt_lsb_minus4 = LOG2_MAX_PIC_ORDER_CNT - 4;
+
+	sps->sub_layer_ordering_info_present_flag = 1;
+	sps->max_dec_pic_buffering_minus1[0] = num_ref_frames;
+	sps->max_num_reorder_pics[0] = num_ref_frames;
+
+	sps->log2_min_luma_coding_block_size_minus3 =
+		channel->min_cu_size - 3;
+	sps->log2_diff_max_min_luma_coding_block_size =
+		channel->max_cu_size - channel->min_cu_size;
+	sps->log2_min_luma_transform_block_size_minus2 =
+		channel->min_tu_size - 2;
+	sps->log2_diff_max_min_luma_transform_block_size =
+		channel->max_tu_size - channel->min_tu_size;
+	sps->max_transform_hierarchy_depth_intra =
+		channel->max_transfo_depth_intra;
+	sps->max_transform_hierarchy_depth_inter =
+		channel->max_transfo_depth_inter;
+
+	sps->sps_temporal_mvp_enabled_flag = channel->temporal_mvp_enable;
+	sps->strong_intra_smoothing_enabled_flag = channel->max_cu_size > 4;
+
+	sps->vui_parameters_present_flag = 1;
+	vui = &sps->vui;
+
+	vui->video_signal_type_present_flag = 1;
+	vui->video_format = 5; /* unspecified */
+	vui->video_full_range_flag = nal_hevc_full_range(channel->quantization);
+	vui->colour_description_present_flag = 1;
+	vui->colour_primaries = nal_hevc_color_primaries(channel->colorspace);
+	vui->transfer_characteristics = nal_hevc_transfer_characteristics(channel->colorspace,
+									  channel->xfer_func);
+	vui->matrix_coeffs = nal_hevc_matrix_coeffs(channel->colorspace, channel->ycbcr_enc);
+
+	vui->chroma_loc_info_present_flag = 1;
+	vui->chroma_sample_loc_type_top_field = 0;
+	vui->chroma_sample_loc_type_bottom_field = 0;
+
+	vui->vui_timing_info_present_flag = 1;
+	vui->vui_num_units_in_tick = channel->framerate.denominator;
+	vui->vui_time_scale = channel->framerate.numerator;
+
+	vui->bitstream_restriction_flag = 1;
+	vui->motion_vectors_over_pic_boundaries_flag = 1;
+	vui->restricted_ref_pic_lists_flag = 1;
+	vui->log2_max_mv_length_horizontal = 15;
+	vui->log2_max_mv_length_vertical = 15;
+
+	vui->vui_hrd_parameters_present_flag = 1;
+	hrd = &vui->nal_hrd_parameters;
+	hrd->vcl_hrd_parameters_present_flag = 1;
+
+	hrd->initial_cpb_removal_delay_length_minus1 = 31;
+	hrd->au_cpb_removal_delay_length_minus1 = 30;
+	hrd->dpb_output_delay_length_minus1 = 30;
+
+	hrd->bit_rate_scale = ffs(channel->bitrate_peak) - 6;
+	hrd->vcl_hrd[0].bit_rate_value_minus1[0] =
+		(channel->bitrate_peak >> (6 + hrd->bit_rate_scale)) - 1;
+
+	cpb_size = v4l2_ctrl_g_ctrl(channel->mpeg_video_cpb_size) * 1000;
+	hrd->cpb_size_scale = ffs(cpb_size) - 4;
+	hrd->vcl_hrd[0].cpb_size_value_minus1[0] = (cpb_size >> (4 + hrd->cpb_size_scale)) - 1;
+
+	hrd->vcl_hrd[0].cbr_flag[0] = !v4l2_ctrl_g_ctrl(channel->mpeg_video_frame_rc_enable);
+
+	size = nal_hevc_write_sps(&dev->plat_dev->dev, dest, n, sps);
+
+	kfree(sps);
+
+	return size;
+}
+
+static ssize_t allegro_hevc_write_pps(struct allegro_channel *channel,
+				      struct mcu_msg_encode_frame_response *msg,
+				      void *dest, size_t n)
+{
+	struct allegro_dev *dev = channel->dev;
+	struct nal_hevc_pps *pps;
+	ssize_t size;
+	int i;
+
+	pps = kzalloc(sizeof(*pps), GFP_KERNEL);
+	if (!pps)
+		return -ENOMEM;
+
+	pps->pps_pic_parameter_set_id = 0;
+	pps->pps_seq_parameter_set_id = 0;
+
+	if (msg->num_column > 1 || msg->num_row > 1) {
+		pps->tiles_enabled_flag = 1;
+		pps->num_tile_columns_minus1 = msg->num_column - 1;
+		pps->num_tile_rows_minus1 = msg->num_row - 1;
+
+		for (i = 0; i < msg->num_column; i++)
+			pps->column_width_minus1[i] = msg->tile_width[i] - 1;
+
+		for (i = 0; i < msg->num_row; i++)
+			pps->row_height_minus1[i] = msg->tile_height[i] - 1;
+	}
+
+	pps->loop_filter_across_tiles_enabled_flag =
+		channel->enable_loop_filter_across_tiles;
+	pps->pps_loop_filter_across_slices_enabled_flag =
+		channel->enable_loop_filter_across_slices;
+	pps->deblocking_filter_control_present_flag = 1;
+	pps->deblocking_filter_override_enabled_flag =
+		channel->enable_deblocking_filter_override;
+	pps->pps_beta_offset_div2 = BETA_OFFSET_DIV_2;
+	pps->pps_tc_offset_div2 = TC_OFFSET_DIV_2;
+
+	pps->lists_modification_present_flag = channel->enable_reordering;
+
+	size = nal_hevc_write_pps(&dev->plat_dev->dev, dest, n, pps);
+
+	kfree(pps);
+
+	return size;
 }
 
 static u64 allegro_put_buffer(struct allegro_channel *channel,
@@ -1502,8 +2039,27 @@ static void allegro_channel_finish_frame(struct allegro_channel *channel,
 
 	curr = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 	free = partition->offset;
+
+	if (channel->codec == V4L2_PIX_FMT_HEVC && msg->is_idr) {
+		len = allegro_hevc_write_vps(channel, curr, free);
+		if (len < 0) {
+			v4l2_err(&dev->v4l2_dev,
+				 "not enough space for video parameter set: %zd left\n",
+				 free);
+			goto err;
+		}
+		curr += len;
+		free -= len;
+		v4l2_dbg(1, debug, &dev->v4l2_dev,
+			 "channel %d: wrote %zd byte VPS nal unit\n",
+			 channel->mcu_channel_id, len);
+	}
+
 	if (msg->is_idr) {
-		len = allegro_h264_write_sps(channel, curr, free);
+		if (channel->codec == V4L2_PIX_FMT_H264)
+			len = allegro_h264_write_sps(channel, curr, free);
+		else
+			len = allegro_hevc_write_sps(channel, curr, free);
 		if (len < 0) {
 			v4l2_err(&dev->v4l2_dev,
 				 "not enough space for sequence parameter set: %zd left\n",
@@ -1518,7 +2074,10 @@ static void allegro_channel_finish_frame(struct allegro_channel *channel,
 	}
 
 	if (msg->slice_type == AL_ENC_SLICE_TYPE_I) {
-		len = allegro_h264_write_pps(channel, curr, free);
+		if (channel->codec == V4L2_PIX_FMT_H264)
+			len = allegro_h264_write_pps(channel, curr, free);
+		else
+			len = allegro_hevc_write_pps(channel, msg, curr, free);
 		if (len < 0) {
 			v4l2_err(&dev->v4l2_dev,
 				 "not enough space for picture parameter set: %zd left\n",
@@ -1536,7 +2095,10 @@ static void allegro_channel_finish_frame(struct allegro_channel *channel,
 		dst_buf->vb2_buf.planes[0].data_offset = free;
 		free = 0;
 	} else {
-		len = nal_h264_write_filler(&dev->plat_dev->dev, curr, free);
+		if (channel->codec == V4L2_PIX_FMT_H264)
+			len = nal_h264_write_filler(&dev->plat_dev->dev, curr, free);
+		else
+			len = nal_hevc_write_filler(&dev->plat_dev->dev, curr, free);
 		if (len < 0) {
 			v4l2_err(&dev->v4l2_dev,
 				 "failed to write %zd filler data\n", free);
@@ -1754,6 +2316,15 @@ static irqreturn_t allegro_irq_thread(int irq, void *data)
 {
 	struct allegro_dev *dev = data;
 
+	/*
+	 * The firmware is initialized after the mailbox is setup. We further
+	 * check the AL5_ITC_CPU_IRQ_STA register, if the firmware actually
+	 * triggered the interrupt. Although this should not happen, make sure
+	 * that we ignore interrupts, if the mailbox is not initialized.
+	 */
+	if (!dev->mbox_status)
+		return IRQ_NONE;
+
 	allegro_mbox_notify(dev->mbox_status);
 
 	return IRQ_HANDLED;
@@ -1936,12 +2507,24 @@ static void allegro_destroy_channel(struct allegro_channel *channel)
 	v4l2_ctrl_grab(channel->mpeg_video_h264_min_qp, false);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_p_frame_qp, false);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_b_frame_qp, false);
+
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_profile, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_level, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_tier, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_i_frame_qp, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_max_qp, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_min_qp, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_p_frame_qp, false);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_b_frame_qp, false);
+
 	v4l2_ctrl_grab(channel->mpeg_video_frame_rc_enable, false);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate_mode, false);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate, false);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate_peak, false);
 	v4l2_ctrl_grab(channel->mpeg_video_cpb_size, false);
 	v4l2_ctrl_grab(channel->mpeg_video_gop_size, false);
+
+	v4l2_ctrl_grab(channel->encoder_buffer, false);
 
 	if (channel->user_id != -1) {
 		clear_bit(channel->user_id, &dev->channel_user_ids);
@@ -1963,7 +2546,6 @@ static int allegro_create_channel(struct allegro_channel *channel)
 {
 	struct allegro_dev *dev = channel->dev;
 	unsigned long timeout;
-	enum v4l2_mpeg_video_h264_level min_level;
 
 	if (channel_exists(channel)) {
 		v4l2_warn(&dev->v4l2_dev,
@@ -1986,16 +2568,6 @@ static int allegro_create_channel(struct allegro_channel *channel)
 		 DIV_ROUND_UP(channel->framerate.numerator,
 			      channel->framerate.denominator));
 
-	min_level = select_minimum_h264_level(channel->width, channel->height);
-	if (channel->level < min_level) {
-		v4l2_warn(&dev->v4l2_dev,
-			  "user %d: selected Level %s too low: increasing to Level %s\n",
-			  channel->user_id,
-			  v4l2_ctrl_get_menu(V4L2_CID_MPEG_VIDEO_H264_LEVEL)[channel->level],
-			  v4l2_ctrl_get_menu(V4L2_CID_MPEG_VIDEO_H264_LEVEL)[min_level]);
-		channel->level = min_level;
-	}
-
 	v4l2_ctrl_grab(channel->mpeg_video_h264_profile, true);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_level, true);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_i_frame_qp, true);
@@ -2003,12 +2575,24 @@ static int allegro_create_channel(struct allegro_channel *channel)
 	v4l2_ctrl_grab(channel->mpeg_video_h264_min_qp, true);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_p_frame_qp, true);
 	v4l2_ctrl_grab(channel->mpeg_video_h264_b_frame_qp, true);
+
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_profile, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_level, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_tier, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_i_frame_qp, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_max_qp, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_min_qp, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_p_frame_qp, true);
+	v4l2_ctrl_grab(channel->mpeg_video_hevc_b_frame_qp, true);
+
 	v4l2_ctrl_grab(channel->mpeg_video_frame_rc_enable, true);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate_mode, true);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate, true);
 	v4l2_ctrl_grab(channel->mpeg_video_bitrate_peak, true);
 	v4l2_ctrl_grab(channel->mpeg_video_cpb_size, true);
 	v4l2_ctrl_grab(channel->mpeg_video_gop_size, true);
+
+	v4l2_ctrl_grab(channel->encoder_buffer, true);
 
 	reinit_completion(&channel->completion);
 	allegro_mcu_send_create_channel(dev, channel);
@@ -2031,6 +2615,124 @@ err:
 	return channel->error;
 }
 
+/**
+ * allegro_channel_adjust() - Adjust channel parameters to current format
+ * @channel: the channel to adjust
+ *
+ * Various parameters of a channel and their limits depend on the currently
+ * set format. Adjust the parameters after a format change in one go.
+ */
+static void allegro_channel_adjust(struct allegro_channel *channel)
+{
+	struct allegro_dev *dev = channel->dev;
+	u32 codec = channel->codec;
+	struct v4l2_ctrl *ctrl;
+	s64 min;
+	s64 max;
+
+	channel->sizeimage_encoded =
+		estimate_stream_size(channel->width, channel->height);
+
+	if (codec == V4L2_PIX_FMT_H264) {
+		ctrl = channel->mpeg_video_h264_level;
+		min = select_minimum_h264_level(channel->width, channel->height);
+	} else {
+		ctrl = channel->mpeg_video_hevc_level;
+		min = select_minimum_hevc_level(channel->width, channel->height);
+	}
+	if (ctrl->minimum > min)
+		v4l2_dbg(1, debug, &dev->v4l2_dev,
+			 "%s.minimum: %lld -> %lld\n",
+			 v4l2_ctrl_get_name(ctrl->id), ctrl->minimum, min);
+	v4l2_ctrl_lock(ctrl);
+	__v4l2_ctrl_modify_range(ctrl, min, ctrl->maximum,
+				 ctrl->step, ctrl->default_value);
+	v4l2_ctrl_unlock(ctrl);
+
+	ctrl = channel->mpeg_video_bitrate;
+	if (codec == V4L2_PIX_FMT_H264)
+		max = h264_maximum_bitrate(v4l2_ctrl_g_ctrl(channel->mpeg_video_h264_level));
+	else
+		max = hevc_maximum_bitrate(v4l2_ctrl_g_ctrl(channel->mpeg_video_hevc_level));
+	if (ctrl->maximum < max)
+		v4l2_dbg(1, debug, &dev->v4l2_dev,
+			 "%s: maximum: %lld -> %lld\n",
+			 v4l2_ctrl_get_name(ctrl->id), ctrl->maximum, max);
+	v4l2_ctrl_lock(ctrl);
+	__v4l2_ctrl_modify_range(ctrl, ctrl->minimum, max,
+				 ctrl->step, ctrl->default_value);
+	v4l2_ctrl_unlock(ctrl);
+
+	ctrl = channel->mpeg_video_bitrate_peak;
+	v4l2_ctrl_lock(ctrl);
+	__v4l2_ctrl_modify_range(ctrl, ctrl->minimum, max,
+				 ctrl->step, ctrl->default_value);
+	v4l2_ctrl_unlock(ctrl);
+
+	v4l2_ctrl_activate(channel->mpeg_video_h264_profile,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_level,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_i_frame_qp,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_max_qp,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_min_qp,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_p_frame_qp,
+			   codec == V4L2_PIX_FMT_H264);
+	v4l2_ctrl_activate(channel->mpeg_video_h264_b_frame_qp,
+			   codec == V4L2_PIX_FMT_H264);
+
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_profile,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_level,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_tier,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_i_frame_qp,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_max_qp,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_min_qp,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_p_frame_qp,
+			   codec == V4L2_PIX_FMT_HEVC);
+	v4l2_ctrl_activate(channel->mpeg_video_hevc_b_frame_qp,
+			   codec == V4L2_PIX_FMT_HEVC);
+
+	if (codec == V4L2_PIX_FMT_H264)
+		channel->log2_max_frame_num = LOG2_MAX_FRAME_NUM;
+	channel->temporal_mvp_enable = true;
+	channel->dbf_ovr_en = (codec == V4L2_PIX_FMT_H264);
+	channel->enable_deblocking_filter_override = (codec == V4L2_PIX_FMT_HEVC);
+	channel->enable_reordering = (codec == V4L2_PIX_FMT_HEVC);
+	channel->enable_loop_filter_across_tiles = true;
+	channel->enable_loop_filter_across_slices = true;
+
+	if (codec == V4L2_PIX_FMT_H264) {
+		channel->b_hrz_me_range = 8;
+		channel->b_vrt_me_range = 8;
+		channel->p_hrz_me_range = 16;
+		channel->p_vrt_me_range = 16;
+		channel->max_cu_size = ilog2(16);
+		channel->min_cu_size = ilog2(8);
+		channel->max_tu_size = ilog2(4);
+		channel->min_tu_size = ilog2(4);
+	} else {
+		channel->b_hrz_me_range = 16;
+		channel->b_vrt_me_range = 16;
+		channel->p_hrz_me_range = 32;
+		channel->p_vrt_me_range = 32;
+		channel->max_cu_size = ilog2(32);
+		channel->min_cu_size = ilog2(8);
+		channel->max_tu_size = ilog2(32);
+		channel->min_tu_size = ilog2(4);
+	}
+	channel->max_transfo_depth_intra = 1;
+	channel->max_transfo_depth_inter = 1;
+}
+
 static void allegro_set_default_params(struct allegro_channel *channel)
 {
 	channel->width = ALLEGRO_WIDTH_DEFAULT;
@@ -2047,16 +2749,6 @@ static void allegro_set_default_params(struct allegro_channel *channel)
 	channel->sizeimage_raw = channel->stride * channel->height * 3 / 2;
 
 	channel->codec = V4L2_PIX_FMT_H264;
-	channel->profile = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
-	channel->level =
-		select_minimum_h264_level(channel->width, channel->height);
-	channel->sizeimage_encoded =
-		estimate_stream_size(channel->width, channel->height);
-
-	channel->bitrate = maximum_bitrate(channel->level);
-	channel->bitrate_peak = maximum_bitrate(channel->level);
-	channel->cpb_size = maximum_cpb_size(channel->level);
-	channel->gop_size = ALLEGRO_GOP_SIZE_DEFAULT;
 }
 
 static int allegro_queue_setup(struct vb2_queue *vq,
@@ -2123,7 +2815,7 @@ static void allegro_buf_queue(struct vb2_buffer *vb)
 		unsigned int i;
 
 		for (i = 0; i < vb->num_planes; i++)
-			vb->planes[i].bytesused = 0;
+			vb2_set_plane_payload(vb, i, 0);
 
 		vbuf->field = V4L2_FIELD_NONE;
 		vbuf->sequence = channel->csequence++;
@@ -2285,6 +2977,10 @@ static int allegro_try_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
 		allegro_clamp_bitrate(channel, ctrl);
 		break;
+	case V4L2_CID_USER_ALLEGRO_ENCODER_BUFFER:
+		if (!channel->dev->has_encoder_buffer)
+			ctrl->val = 0;
+		break;
 	}
 
 	return 0;
@@ -2301,9 +2997,6 @@ static int allegro_s_ctrl(struct v4l2_ctrl *ctrl)
 		 "s_ctrl: %s = %d\n", v4l2_ctrl_get_name(ctrl->id), ctrl->val);
 
 	switch (ctrl->id) {
-	case V4L2_CID_MPEG_VIDEO_H264_LEVEL:
-		channel->level = ctrl->val;
-		break;
 	case V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE:
 		channel->frame_rc_enable = ctrl->val;
 		break;
@@ -2312,12 +3005,6 @@ static int allegro_s_ctrl(struct v4l2_ctrl *ctrl)
 		channel->bitrate_peak = channel->mpeg_video_bitrate_peak->val;
 		v4l2_ctrl_activate(channel->mpeg_video_bitrate_peak,
 				   ctrl->val == V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
-		break;
-	case V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE:
-		channel->cpb_size = ctrl->val;
-		break;
-	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
-		channel->gop_size = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP:
 	case V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP:
@@ -2334,6 +3021,16 @@ static const struct v4l2_ctrl_ops allegro_ctrl_ops = {
 	.s_ctrl = allegro_s_ctrl,
 };
 
+static const struct v4l2_ctrl_config allegro_encoder_buffer_ctrl_config = {
+	.id = V4L2_CID_USER_ALLEGRO_ENCODER_BUFFER,
+	.name = "Encoder Buffer Enable",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 1,
+};
+
 static int allegro_open(struct file *file)
 {
 	struct video_device *vdev = video_devdata(file);
@@ -2342,6 +3039,10 @@ static int allegro_open(struct file *file)
 	struct v4l2_ctrl_handler *handler;
 	u64 mask;
 	int ret;
+	unsigned int bitrate_max;
+	unsigned int bitrate_def;
+	unsigned int cpb_size_max;
+	unsigned int cpb_size_def;
 
 	channel = kzalloc(sizeof(*channel), GFP_KERNEL);
 	if (!channel)
@@ -2396,6 +3097,51 @@ static int allegro_open(struct file *file)
 				  &allegro_ctrl_ops,
 				  V4L2_CID_MPEG_VIDEO_H264_B_FRAME_QP,
 				  0, 51, 1, 30);
+
+	channel->mpeg_video_hevc_profile =
+		v4l2_ctrl_new_std_menu(handler,
+				       &allegro_ctrl_ops,
+				       V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+				       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0x0,
+				       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	channel->mpeg_video_hevc_level =
+		v4l2_ctrl_new_std_menu(handler,
+				       &allegro_ctrl_ops,
+				       V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
+				       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0x0,
+				       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+	channel->mpeg_video_hevc_tier =
+		v4l2_ctrl_new_std_menu(handler,
+				       &allegro_ctrl_ops,
+				       V4L2_CID_MPEG_VIDEO_HEVC_TIER,
+				       V4L2_MPEG_VIDEO_HEVC_TIER_HIGH, 0x0,
+				       V4L2_MPEG_VIDEO_HEVC_TIER_MAIN);
+	channel->mpeg_video_hevc_i_frame_qp =
+		v4l2_ctrl_new_std(handler,
+				  &allegro_ctrl_ops,
+				  V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
+				  0, 51, 1, 30);
+	channel->mpeg_video_hevc_max_qp =
+		v4l2_ctrl_new_std(handler,
+				  &allegro_ctrl_ops,
+				  V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
+				  0, 51, 1, 51);
+	channel->mpeg_video_hevc_min_qp =
+		v4l2_ctrl_new_std(handler,
+				  &allegro_ctrl_ops,
+				  V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
+				  0, 51, 1, 0);
+	channel->mpeg_video_hevc_p_frame_qp =
+		v4l2_ctrl_new_std(handler,
+				  &allegro_ctrl_ops,
+				  V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
+				  0, 51, 1, 30);
+	channel->mpeg_video_hevc_b_frame_qp =
+		v4l2_ctrl_new_std(handler,
+				  &allegro_ctrl_ops,
+				  V4L2_CID_MPEG_VIDEO_HEVC_B_FRAME_QP,
+				  0, 51, 1, 30);
+
 	channel->mpeg_video_frame_rc_enable =
 		v4l2_ctrl_new_std(handler,
 				  &allegro_ctrl_ops,
@@ -2407,26 +3153,37 @@ static int allegro_open(struct file *file)
 			V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 			V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, 0,
 			V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
+
+	if (channel->codec == V4L2_PIX_FMT_H264) {
+		bitrate_max = h264_maximum_bitrate(V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+		bitrate_def = h264_maximum_bitrate(V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+		cpb_size_max = h264_maximum_cpb_size(V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+		cpb_size_def = h264_maximum_cpb_size(V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+	} else {
+		bitrate_max = hevc_maximum_bitrate(V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+		bitrate_def = hevc_maximum_bitrate(V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+		cpb_size_max = hevc_maximum_cpb_size(V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+		cpb_size_def = hevc_maximum_cpb_size(V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1);
+	}
 	channel->mpeg_video_bitrate = v4l2_ctrl_new_std(handler,
 			&allegro_ctrl_ops,
 			V4L2_CID_MPEG_VIDEO_BITRATE,
-			0, maximum_bitrate(V4L2_MPEG_VIDEO_H264_LEVEL_5_1),
-			1, channel->bitrate);
+			0, bitrate_max, 1, bitrate_def);
 	channel->mpeg_video_bitrate_peak = v4l2_ctrl_new_std(handler,
 			&allegro_ctrl_ops,
 			V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
-			0, maximum_bitrate(V4L2_MPEG_VIDEO_H264_LEVEL_5_1),
-			1, channel->bitrate_peak);
+			0, bitrate_max, 1, bitrate_def);
 	channel->mpeg_video_cpb_size = v4l2_ctrl_new_std(handler,
 			&allegro_ctrl_ops,
 			V4L2_CID_MPEG_VIDEO_H264_CPB_SIZE,
-			0, maximum_cpb_size(V4L2_MPEG_VIDEO_H264_LEVEL_5_1),
-			1, channel->cpb_size);
+			0, cpb_size_max, 1, cpb_size_def);
 	channel->mpeg_video_gop_size = v4l2_ctrl_new_std(handler,
 			&allegro_ctrl_ops,
 			V4L2_CID_MPEG_VIDEO_GOP_SIZE,
 			0, ALLEGRO_GOP_SIZE_MAX,
-			1, channel->gop_size);
+			1, ALLEGRO_GOP_SIZE_DEFAULT);
+	channel->encoder_buffer = v4l2_ctrl_new_custom(handler,
+			&allegro_encoder_buffer_ctrl_config, NULL);
 	v4l2_ctrl_new_std(handler,
 			  &allegro_ctrl_ops,
 			  V4L2_CID_MIN_BUFFERS_FOR_OUTPUT,
@@ -2440,6 +3197,8 @@ static int allegro_open(struct file *file)
 	channel->fh.ctrl_handler = handler;
 
 	v4l2_ctrl_cluster(3, &channel->mpeg_video_bitrate_mode);
+
+	v4l2_ctrl_handler_setup(handler);
 
 	channel->mcu_channel_id = -1;
 	channel->user_id = -1;
@@ -2458,6 +3217,8 @@ static int allegro_open(struct file *file)
 	list_add(&channel->list, &dev->channels);
 	file->private_data = &channel->fh;
 	v4l2_fh_add(&channel->fh);
+
+	allegro_channel_adjust(channel);
 
 	return 0;
 
@@ -2502,14 +3263,19 @@ static int allegro_querycap(struct file *file, void *fh,
 static int allegro_enum_fmt_vid(struct file *file, void *fh,
 				struct v4l2_fmtdesc *f)
 {
-	if (f->index)
-		return -EINVAL;
 	switch (f->type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		if (f->index >= 1)
+			return -EINVAL;
 		f->pixelformat = V4L2_PIX_FMT_NV12;
 		break;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-		f->pixelformat = V4L2_PIX_FMT_H264;
+		if (f->index >= 2)
+			return -EINVAL;
+		if (f->index == 0)
+			f->pixelformat = V4L2_PIX_FMT_H264;
+		if (f->index == 1)
+			f->pixelformat = V4L2_PIX_FMT_HEVC;
 		break;
 	default:
 		return -EINVAL;
@@ -2548,10 +3314,37 @@ static int allegro_try_fmt_vid_cap(struct file *file, void *fh,
 	f->fmt.pix.height = clamp_t(__u32, f->fmt.pix.height,
 				    ALLEGRO_HEIGHT_MIN, ALLEGRO_HEIGHT_MAX);
 
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_HEVC &&
+	    f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
+		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+
 	f->fmt.pix.bytesperline = 0;
 	f->fmt.pix.sizeimage =
 		estimate_stream_size(f->fmt.pix.width, f->fmt.pix.height);
+
+	return 0;
+}
+
+static int allegro_s_fmt_vid_cap(struct file *file, void *fh,
+				 struct v4l2_format *f)
+{
+	struct allegro_channel *channel = fh_to_channel(fh);
+	struct vb2_queue *vq;
+	int err;
+
+	err = allegro_try_fmt_vid_cap(file, fh, f);
+	if (err)
+		return err;
+
+	vq = v4l2_m2m_get_vq(channel->fh.m2m_ctx, f->type);
+	if (!vq)
+		return -EINVAL;
+	if (vb2_is_busy(vq))
+		return -EBUSY;
+
+	channel->codec = f->fmt.pix.pixelformat;
+
+	allegro_channel_adjust(channel);
 
 	return 0;
 }
@@ -2623,10 +3416,7 @@ static int allegro_s_fmt_vid_out(struct file *file, void *fh,
 	channel->quantization = f->fmt.pix.quantization;
 	channel->xfer_func = f->fmt.pix.xfer_func;
 
-	channel->level =
-		select_minimum_h264_level(channel->width, channel->height);
-	channel->sizeimage_encoded =
-		estimate_stream_size(channel->width, channel->height);
+	allegro_channel_adjust(channel);
 
 	return 0;
 }
@@ -2674,6 +3464,7 @@ static int allegro_enum_framesizes(struct file *file, void *fh,
 				   struct v4l2_frmsizeenum *fsize)
 {
 	switch (fsize->pixel_format) {
+	case V4L2_PIX_FMT_HEVC:
 	case V4L2_PIX_FMT_H264:
 	case V4L2_PIX_FMT_NV12:
 		break;
@@ -2768,7 +3559,7 @@ static const struct v4l2_ioctl_ops allegro_ioctl_ops = {
 	.vidioc_enum_fmt_vid_out = allegro_enum_fmt_vid,
 	.vidioc_g_fmt_vid_cap = allegro_g_fmt_vid_cap,
 	.vidioc_try_fmt_vid_cap = allegro_try_fmt_vid_cap,
-	.vidioc_s_fmt_vid_cap = allegro_try_fmt_vid_cap,
+	.vidioc_s_fmt_vid_cap = allegro_s_fmt_vid_cap,
 	.vidioc_g_fmt_vid_out = allegro_g_fmt_vid_out,
 	.vidioc_try_fmt_vid_out = allegro_try_fmt_vid_out,
 	.vidioc_s_fmt_vid_out = allegro_s_fmt_vid_out,
@@ -2873,6 +3664,11 @@ static int allegro_mcu_hw_init(struct allegro_dev *dev,
 		return -EIO;
 	}
 
+	err = allegro_encoder_buffer_init(dev, &dev->encoder_buffer);
+	dev->has_encoder_buffer = (err == 0);
+	if (!dev->has_encoder_buffer)
+		v4l2_info(&dev->v4l2_dev, "encoder buffer not available\n");
+
 	allegro_mcu_enable_interrupts(dev);
 
 	/* The mcu sends INIT after reset. */
@@ -2960,11 +3756,16 @@ static void allegro_fw_callback(const struct firmware *fw, void *context)
 	v4l2_info(&dev->v4l2_dev,
 		  "using mcu firmware version '%s'\n", dev->fw_info->version);
 
+	pm_runtime_enable(&dev->plat_dev->dev);
+	err = pm_runtime_resume_and_get(&dev->plat_dev->dev);
+	if (err)
+		goto err_release_firmware_codec;
+
 	/* Ensure that the mcu is sleeping at the reset vector */
 	err = allegro_mcu_reset(dev);
 	if (err) {
 		v4l2_err(&dev->v4l2_dev, "failed to reset mcu\n");
-		goto err_release_firmware_codec;
+		goto err_suspend;
 	}
 
 	allegro_copy_firmware(dev, fw->data, fw->size);
@@ -2992,6 +3793,8 @@ static void allegro_fw_callback(const struct firmware *fw, void *context)
 		 "allegro codec registered as /dev/video%d\n",
 		 dev->video_dev.num);
 
+	dev->initialized = true;
+
 	release_firmware(fw_codec);
 	release_firmware(fw);
 
@@ -3004,6 +3807,9 @@ err_mcu_hw_deinit:
 	allegro_mcu_hw_deinit(dev);
 err_free_fw_codec:
 	allegro_free_fw_codec(dev);
+err_suspend:
+	pm_runtime_put(&dev->plat_dev->dev);
+	pm_runtime_disable(&dev->plat_dev->dev);
 err_release_firmware_codec:
 	release_firmware(fw_codec);
 err_release_firmware:
@@ -3037,6 +3843,8 @@ static int allegro_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&dev->channels);
 
 	mutex_init(&dev->lock);
+
+	dev->initialized = false;
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
 	if (!res) {
@@ -3076,6 +3884,18 @@ static int allegro_probe(struct platform_device *pdev)
 		return PTR_ERR(dev->sram);
 	}
 
+	dev->settings = syscon_regmap_lookup_by_compatible("xlnx,vcu-settings");
+	if (IS_ERR(dev->settings))
+		dev_warn(&pdev->dev, "failed to open settings\n");
+
+	dev->clk_core = devm_clk_get(&pdev->dev, "core_clk");
+	if (IS_ERR(dev->clk_core))
+		return PTR_ERR(dev->clk_core);
+
+	dev->clk_mcu = devm_clk_get(&pdev->dev, "mcu_clk");
+	if (IS_ERR(dev->clk_mcu))
+		return PTR_ERR(dev->clk_mcu);
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
@@ -3108,13 +3928,71 @@ static int allegro_remove(struct platform_device *pdev)
 {
 	struct allegro_dev *dev = platform_get_drvdata(pdev);
 
-	video_unregister_device(&dev->video_dev);
-	if (dev->m2m_dev)
-		v4l2_m2m_release(dev->m2m_dev);
-	allegro_mcu_hw_deinit(dev);
-	allegro_free_fw_codec(dev);
+	if (dev->initialized) {
+		video_unregister_device(&dev->video_dev);
+		if (dev->m2m_dev)
+			v4l2_m2m_release(dev->m2m_dev);
+		allegro_mcu_hw_deinit(dev);
+		allegro_free_fw_codec(dev);
+	}
+
+	pm_runtime_put(&dev->plat_dev->dev);
+	pm_runtime_disable(&dev->plat_dev->dev);
 
 	v4l2_device_unregister(&dev->v4l2_dev);
+
+	return 0;
+}
+
+static int allegro_runtime_resume(struct device *device)
+{
+	struct allegro_dev *dev = dev_get_drvdata(device);
+	struct regmap *settings = dev->settings;
+	unsigned int clk_mcu;
+	unsigned int clk_core;
+	int err;
+
+	if (!settings)
+		return -EINVAL;
+
+#define MHZ_TO_HZ(freq) ((freq) * 1000 * 1000)
+
+	err = regmap_read(settings, VCU_CORE_CLK, &clk_core);
+	if (err < 0)
+		return err;
+	err = clk_set_rate(dev->clk_core, MHZ_TO_HZ(clk_core));
+	if (err < 0)
+		return err;
+	err = clk_prepare_enable(dev->clk_core);
+	if (err)
+		return err;
+
+	err = regmap_read(settings, VCU_MCU_CLK, &clk_mcu);
+	if (err < 0)
+		goto disable_clk_core;
+	err = clk_set_rate(dev->clk_mcu, MHZ_TO_HZ(clk_mcu));
+	if (err < 0)
+		goto disable_clk_core;
+	err = clk_prepare_enable(dev->clk_mcu);
+	if (err)
+		goto disable_clk_core;
+
+#undef MHZ_TO_HZ
+
+	return 0;
+
+disable_clk_core:
+	clk_disable_unprepare(dev->clk_core);
+
+	return err;
+}
+
+static int allegro_runtime_suspend(struct device *device)
+{
+	struct allegro_dev *dev = dev_get_drvdata(device);
+
+	clk_disable_unprepare(dev->clk_mcu);
+	clk_disable_unprepare(dev->clk_core);
 
 	return 0;
 }
@@ -3126,12 +4004,18 @@ static const struct of_device_id allegro_dt_ids[] = {
 
 MODULE_DEVICE_TABLE(of, allegro_dt_ids);
 
+static const struct dev_pm_ops allegro_pm_ops = {
+	.runtime_resume = allegro_runtime_resume,
+	.runtime_suspend = allegro_runtime_suspend,
+};
+
 static struct platform_driver allegro_driver = {
 	.probe = allegro_probe,
 	.remove = allegro_remove,
 	.driver = {
 		.name = "allegro",
 		.of_match_table = of_match_ptr(allegro_dt_ids),
+		.pm = &allegro_pm_ops,
 	},
 };
 

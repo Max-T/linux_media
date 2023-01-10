@@ -242,7 +242,7 @@ static int tegra194_cpufreq_init(struct cpufreq_policy *policy)
 
 	smp_call_function_single(policy->cpu, get_cpu_cluster, &cl, true);
 
-	if (cl >= data->num_clusters)
+	if (cl >= data->num_clusters || !data->tables[cl])
 		return -EINVAL;
 
 	/* set same policy for all cpus in a cluster */
@@ -272,8 +272,7 @@ static int tegra194_cpufreq_set_target(struct cpufreq_policy *policy,
 
 static struct cpufreq_driver tegra194_cpufreq_driver = {
 	.name = "tegra194",
-	.flags = CPUFREQ_STICKY | CPUFREQ_CONST_LOOPS |
-		CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.flags = CPUFREQ_CONST_LOOPS | CPUFREQ_NEED_INITIAL_FREQ_CHECK,
 	.verify = cpufreq_generic_frequency_table_verify,
 	.target_index = tegra194_cpufreq_set_target,
 	.get = tegra194_get_speed,
@@ -311,6 +310,12 @@ init_freq_table(struct platform_device *pdev, struct tegra_bpmp *bpmp,
 	err = tegra_bpmp_transfer(bpmp, &msg);
 	if (err)
 		return ERR_PTR(err);
+	if (msg.rx.ret == -BPMP_EINVAL) {
+		/* Cluster not available */
+		return NULL;
+	}
+	if (msg.rx.ret)
+		return ERR_PTR(-EINVAL);
 
 	/*
 	 * Make sure frequency table step is a multiple of mdiv to match

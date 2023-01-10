@@ -448,7 +448,8 @@ static bool lsdir_bid_tail_filter(const char *name __maybe_unused,
 	int i = 0;
 	while (isxdigit(d->d_name[i]) && i < SBUILD_ID_SIZE - 3)
 		i++;
-	return (i == SBUILD_ID_SIZE - 3) && (d->d_name[i] == '\0');
+	return (i >= SBUILD_ID_MIN_SIZE - 3) && (i <= SBUILD_ID_SIZE - 3) &&
+		(d->d_name[i] == '\0');
 }
 
 struct strlist *build_id_cache__list_all(bool validonly)
@@ -490,7 +491,7 @@ struct strlist *build_id_cache__list_all(bool validonly)
 		}
 		strlist__for_each_entry(nd2, linklist) {
 			if (snprintf(sbuild_id, SBUILD_ID_SIZE, "%s%s",
-				     nd->s, nd2->s) != SBUILD_ID_SIZE - 1)
+				     nd->s, nd2->s) > SBUILD_ID_SIZE - 1)
 				goto err_out;
 			if (validonly && !build_id_cache__valid_id(sbuild_id))
 				continue;
@@ -705,7 +706,7 @@ build_id_cache__add(const char *sbuild_id, const char *name, const char *realnam
 		if (is_kallsyms) {
 			if (copyfile("/proc/kallsyms", filename))
 				goto out_free;
-		} else if (nsi && nsi->need_setns) {
+		} else if (nsi && nsinfo__need_setns(nsi)) {
 			if (copyfile_ns(name, filename, nsi))
 				goto out_free;
 		} else if (link(realname, filename) && errno != EEXIST &&
@@ -729,7 +730,7 @@ build_id_cache__add(const char *sbuild_id, const char *name, const char *realnam
 				goto out_free;
 			}
 			if (access(filename, F_OK)) {
-				if (nsi && nsi->need_setns) {
+				if (nsi && nsinfo__need_setns(nsi)) {
 					if (copyfile_ns(debugfile, filename,
 							nsi))
 						goto out_free;
@@ -761,7 +762,7 @@ build_id_cache__add(const char *sbuild_id, const char *name, const char *realnam
 
 		len = readlink(linkname, path, sizeof(path) - 1);
 		if (len <= 0) {
-			pr_err("Cant read link: %s\n", linkname);
+			pr_err("Can't read link: %s\n", linkname);
 			goto out_free;
 		}
 		path[len] = '\0';

@@ -67,7 +67,6 @@ static void dce110_update_generic_info_packet(
 	uint32_t packet_index,
 	const struct dc_info_packet *info_packet)
 {
-	uint32_t regval;
 	/* TODOFPGA Figure out a proper number for max_retries polling for lock
 	 * use 50 for now.
 	 */
@@ -99,7 +98,7 @@ static void dce110_update_generic_info_packet(
 	}
 	/* choose which generic packet to use */
 	{
-		regval = REG_READ(AFMT_VBI_PACKET_CONTROL);
+		REG_READ(AFMT_VBI_PACKET_CONTROL);
 		REG_UPDATE(AFMT_VBI_PACKET_CONTROL,
 				AFMT_GENERIC_INDEX, packet_index);
 	}
@@ -564,6 +563,7 @@ static void dce110_stream_encoder_hdmi_set_stream_attribute(
 	cntl.enable_dp_audio = enable_audio;
 	cntl.pixel_clock = actual_pix_clk_khz;
 	cntl.lanes_number = LANE_COUNT_FOUR;
+	cntl.color_depth = crtc_timing->display_color_depth;
 
 	if (enc110->base.bp->funcs->encoder_control(
 			enc110->base.bp, &cntl) != BP_RESULT_OK)
@@ -919,6 +919,7 @@ static void dce110_stream_encoder_stop_dp_info_packets(
 }
 
 static void dce110_stream_encoder_dp_blank(
+	struct dc_link *link,
 	struct stream_encoder *enc)
 {
 	struct dce110_stream_encoder *enc110 = DCE110STRENC_FROM_STRENC(enc);
@@ -967,6 +968,7 @@ static void dce110_stream_encoder_dp_blank(
 
 /* output video stream to link encoder */
 static void dce110_stream_encoder_dp_unblank(
+	struct dc_link *link,
 	struct stream_encoder *enc,
 	const struct encoder_unblank_param *param)
 {

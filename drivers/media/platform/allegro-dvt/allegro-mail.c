@@ -49,11 +49,11 @@ allegro_enc_init(u32 *dst, struct mcu_msg_init_request *msg)
 	dst[i++] = msg->reserved0;
 	dst[i++] = msg->suballoc_dma;
 	dst[i++] = msg->suballoc_size;
-	dst[i++] = msg->l2_cache[0];
-	dst[i++] = msg->l2_cache[1];
-	dst[i++] = msg->l2_cache[2];
+	dst[i++] = msg->encoder_buffer_size;
+	dst[i++] = msg->encoder_buffer_color_depth;
+	dst[i++] = msg->num_cores;
 	if (version >= MCU_MSG_VERSION_2019_2) {
-		dst[i++] = -1;
+		dst[i++] = msg->clk_rate;
 		dst[i++] = 0;
 	}
 
@@ -67,12 +67,16 @@ static inline u32 settings_get_mcu_codec(struct create_channel_param *param)
 
 	if (version < MCU_MSG_VERSION_2019_2) {
 		switch (pixelformat) {
+		case V4L2_PIX_FMT_HEVC:
+			return 2;
 		case V4L2_PIX_FMT_H264:
 		default:
 			return 1;
 		}
 	} else {
 		switch (pixelformat) {
+		case V4L2_PIX_FMT_HEVC:
+			return 1;
 		case V4L2_PIX_FMT_H264:
 		default:
 			return 0;
@@ -109,12 +113,17 @@ allegro_encode_config_blob(u32 *dst, struct create_channel_param *param)
 
 	val = 0;
 	val |= param->temporal_mvp_enable ? BIT(20) : 0;
-	val |= FIELD_PREP(GENMASK(7, 4), param->log2_max_frame_num) |
-	       FIELD_PREP(GENMASK(3, 0), param->log2_max_poc);
+	val |= FIELD_PREP(GENMASK(7, 4), param->log2_max_frame_num);
+	if (version >= MCU_MSG_VERSION_2019_2)
+		val |= FIELD_PREP(GENMASK(3, 0), param->log2_max_poc - 1);
+	else
+		val |= FIELD_PREP(GENMASK(3, 0), param->log2_max_poc);
 	dst[i++] = val;
 
 	val = 0;
+	val |= param->enable_reordering ? BIT(0) : 0;
 	val |= param->dbf_ovr_en ? BIT(2) : 0;
+	val |= param->override_lf ? BIT(12) : 0;
 	dst[i++] = val;
 
 	if (version >= MCU_MSG_VERSION_2019_2) {
@@ -137,13 +146,10 @@ allegro_encode_config_blob(u32 *dst, struct create_channel_param *param)
 		   FIELD_PREP(GENMASK(7, 0), param->tc_offset);
 	dst[i++] = param->unknown11;
 	dst[i++] = param->unknown12;
-	if (version >= MCU_MSG_VERSION_2019_2)
-		dst[i++] = param->num_slices;
-	else
-		dst[i++] = FIELD_PREP(GENMASK(31, 16), param->prefetch_auto) |
-			   FIELD_PREP(GENMASK(15, 0), param->num_slices);
-	dst[i++] = param->prefetch_mem_offset;
-	dst[i++] = param->prefetch_mem_size;
+	dst[i++] = param->num_slices;
+	dst[i++] = param->encoder_buffer_offset;
+	dst[i++] = param->encoder_buffer_enabled;
+
 	dst[i++] = FIELD_PREP(GENMASK(31, 16), param->clip_vrt_range) |
 		   FIELD_PREP(GENMASK(15, 0), param->clip_hrz_range);
 	dst[i++] = FIELD_PREP(GENMASK(31, 16), param->me_range[1]) |
@@ -420,8 +426,8 @@ allegro_dec_encode_frame(struct mcu_msg_encode_frame_response *msg, u32 *src)
 	msg->frame_tag_size = src[i++];
 	msg->stuffing = src[i++];
 	msg->filler = src[i++];
-	msg->num_column = FIELD_GET(GENMASK(31, 16), src[i]);
-	msg->num_row = FIELD_GET(GENMASK(15, 0), src[i++]);
+	msg->num_row = FIELD_GET(GENMASK(31, 16), src[i]);
+	msg->num_column = FIELD_GET(GENMASK(15, 0), src[i++]);
 	msg->num_ref_idx_l1 = FIELD_GET(GENMASK(31, 24), src[i]);
 	msg->num_ref_idx_l0 = FIELD_GET(GENMASK(23, 16), src[i]);
 	msg->qp = FIELD_GET(GENMASK(15, 0), src[i++]);

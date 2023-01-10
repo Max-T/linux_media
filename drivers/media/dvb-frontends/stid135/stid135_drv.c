@@ -2135,7 +2135,7 @@ static fe_lla_error_t FE_STiD135_GetDemodLock    (fe_stid135_handle_t handle,
 static fe_lla_error_t FE_STiD135_GetFECLock(stchip_handle_t hChip, enum fe_stid135_demod Demod, 
 				u32 TimeOut, BOOL* lock_bool_p)
 {
-	u32 headerField, pktdelinField, lockVitField, timer = 0;
+	u32 headerField, pktdelinField, lockVitField, pedlstatus,timer = 0;
 	s32 lock = 0;
 	fe_lla_error_t error = FE_LLA_NO_ERROR; 
 	s32 fld_value;
@@ -2150,7 +2150,11 @@ static fe_lla_error_t FE_STiD135_GetFECLock(stchip_handle_t hChip, enum fe_stid1
 		
 	error |= ChipGetField(hChip, headerField, &fld_value);
 	demodState = (enum fe_sat_search_state)fld_value;
-	
+	ChipGetOneRegister(hChip, (u16)REG_RC8CODEW_DVBSX_PKTDELIN_PDELSTATUS1(Demod), &pedlstatus);
+	if(pedlstatus&3!=3){
+	ChipSetOneRegister(hChip, (u16)REG_RC8CODEW_DVBSX_DEMOD_DMDISTATE(Demod), 0x05);
+	ChipWaitOrAbort(hChip, 10);	
+	}
 	while ((timer < TimeOut) && (lock == 0)) {
 
 		switch (demodState) {
@@ -2172,6 +2176,9 @@ static fe_lla_error_t FE_STiD135_GetFECLock(stchip_handle_t hChip, enum fe_stid1
 		{
 			ChipWaitOrAbort(hChip, 10);
 			timer += 10;
+			if(timer==150)
+				ChipSetOneRegister(hChip, (u16)REG_RC8CODEW_DVBSX_DEMOD_DMDISTATE(Demod), 0x05);
+
 		}
 	}
 
@@ -2430,7 +2437,7 @@ fe_lla_error_t	fe_stid135_search(fe_stid135_handle_t handle, enum fe_stid135_dem
 			error |= fe_stid135_manage_manual_rolloff(handle, demod);
 		}
 	#endif
-#if 0
+#if 1
 	if((pSearch->symbol_rate >= pParams->master_clock) && (pParams->demod_search_algo[demod-1] == FE_SAT_BLIND_SEARCH)) /* if SR >= MST_CLK  & Blind search algo : usecase forbidden */
 		return(FE_LLA_NOT_SUPPORTED);
 
@@ -3449,7 +3456,7 @@ fe_lla_error_t fe_stid135_init (struct fe_sat_init_params *pInit,
 	/* Internal params structure allocation */
 	#ifdef HOST_PC
 		STCHIP_Info_t DemodChip;
-		pParams = kzalloc(sizeof(struct fe_stid135_internal_param), GFP_KERNEL);
+		pParams = kvzalloc(sizeof(struct fe_stid135_internal_param), GFP_KERNEL);
 		(*handle) = (fe_stid135_handle_t) pParams;
 	#endif
 
@@ -3481,7 +3488,8 @@ fe_lla_error_t fe_stid135_init (struct fe_sat_init_params *pInit,
 		pParams->internal_dcdc = pInit->internal_dcdc;
 		pParams->internal_ldo = pInit->internal_ldo;
 		pParams->rf_input_type = pInit->rf_input_type;
-
+            	pParams->ts_nosync = pInit->ts_nosync;
+	 	pParams->mis = pInit->mis;
 		/* Init for PID filtering feature */
 		for(i=0;i<8;i++)
 			pParams->pid_flt[i].first_disable_all_command = TRUE;
@@ -4791,7 +4799,7 @@ fe_lla_error_t FE_STiD135_Term(fe_stid135_handle_t Handle)
 			ChipClose(pParams->handle_soc);
 
 			if(Handle)
-				kfree(pParams);
+				kvfree(pParams);
 		#endif
 		
 	} else
@@ -4879,15 +4887,9 @@ fe_lla_error_t fe_stid135_manage_matype_info(fe_stid135_handle_t handle,
 
 			/* If TS/GS = 11 (MPEG TS), reset matype force bit and do NOT load frames in MPEG packets */
 			if(((genuine_matype>>6) & 0x3) == 0x3) {
-	  			if((genuine_matype >> 3) & 0x3) {
-					/* CCM or ISSYI used */
-					error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_HWARE_TSSTATE1_TSOUT_NOSYNC(Demod), 0);
-					//error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_HWARE_TSSYNC_TSFIFO_SYNCMODE(Demod), 0);
-				} else {
-					/* ACM and ISSYI not used */
-					error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_HWARE_TSSTATE1_TSOUT_NOSYNC(Demod), 1);
-					//error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_HWARE_TSSYNC_TSFIFO_SYNCMODE(Demod), 2);
-				}
+				/* "TS FIFO Minimum latence mode */
+				if(!pParams->mis)
+				    error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_HWARE_TSSTATE1_TSOUT_NOSYNC(Demod), pParams->ts_nosync ? 1 : 0);
 				/* Unforce HEM mode */
 				error |= ChipSetField(pParams->handle_demod, FLD_FC8CODEW_DVBSX_PKTDELIN_PDELCTRL0_HEMMODE_SELECT(Demod), 0);
 				/* Go back to reset value settings */

@@ -22,9 +22,10 @@
 #include <linux/log2.h>
 
 #include "nal-h264.h"
+#include "nal-rbsp.h"
 
 /*
- * See Rec. ITU-T H.264 (04/2017) Table 7-1 – NAL unit type codes, syntax
+ * See Rec. ITU-T H.264 (04/2017) Table 7-1 - NAL unit type codes, syntax
  * element categories, and NAL unit type classes
  */
 enum nal_unit_type {
@@ -32,403 +33,6 @@ enum nal_unit_type {
 	PICTURE_PARAMETER_SET = 8,
 	FILLER_DATA = 12,
 };
-
-struct rbsp;
-
-struct nal_h264_ops {
-	int (*rbsp_bit)(struct rbsp *rbsp, int *val);
-	int (*rbsp_bits)(struct rbsp *rbsp, int n, unsigned int *val);
-	int (*rbsp_uev)(struct rbsp *rbsp, unsigned int *val);
-	int (*rbsp_sev)(struct rbsp *rbsp, int *val);
-};
-
-/**
- * struct rbsp - State object for handling a raw byte sequence payload
- * @data: pointer to the data of the rbsp
- * @size: maximum size of the data of the rbsp
- * @pos: current bit position inside the rbsp
- * @num_consecutive_zeros: number of zeros before @pos
- * @ops: per datatype functions for interacting with the rbsp
- * @error: an error occurred while handling the rbsp
- *
- * This struct is passed around the various parsing functions and tracks the
- * current position within the raw byte sequence payload.
- *
- * The @ops field allows to separate the operation, i.e., reading/writing a
- * value from/to that rbsp, from the structure of the NAL unit. This allows to
- * have a single function for iterating the NAL unit, while @ops has function
- * pointers for handling each type in the rbsp.
- */
-struct rbsp {
-	u8 *data;
-	size_t size;
-	unsigned int pos;
-	unsigned int num_consecutive_zeros;
-	struct nal_h264_ops *ops;
-	int error;
-};
-
-static void rbsp_init(struct rbsp *rbsp, void *addr, size_t size,
-		      struct nal_h264_ops *ops)
-{
-	if (!rbsp)
-		return;
-
-	rbsp->data = addr;
-	rbsp->size = size;
-	rbsp->pos = 0;
-	rbsp->ops = ops;
-	rbsp->error = 0;
-}
-
-/**
- * nal_h264_profile_from_v4l2() - Get profile_idc for v4l2 h264 profile
- * @profile: the profile as &enum v4l2_mpeg_video_h264_profile
- *
- * Convert the &enum v4l2_mpeg_video_h264_profile to profile_idc as specified
- * in Rec. ITU-T H.264 (04/2017) A.2.
- *
- * Return: the profile_idc for the passed level
- */
-int nal_h264_profile_from_v4l2(enum v4l2_mpeg_video_h264_profile profile)
-{
-	switch (profile) {
-	case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
-		return 66;
-	case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
-		return 77;
-	case V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED:
-		return 88;
-	case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
-		return 100;
-	default:
-		return -EINVAL;
-	}
-}
-
-/**
- * nal_h264_level_from_v4l2() - Get level_idc for v4l2 h264 level
- * @level: the level as &enum v4l2_mpeg_video_h264_level
- *
- * Convert the &enum v4l2_mpeg_video_h264_level to level_idc as specified in
- * Rec. ITU-T H.264 (04/2017) A.3.2.
- *
- * Return: the level_idc for the passed level
- */
-int nal_h264_level_from_v4l2(enum v4l2_mpeg_video_h264_level level)
-{
-	switch (level) {
-	case V4L2_MPEG_VIDEO_H264_LEVEL_1_0:
-		return 10;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_1B:
-		return 9;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_1_1:
-		return 11;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_1_2:
-		return 12;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_1_3:
-		return 13;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_2_0:
-		return 20;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_2_1:
-		return 21;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_2_2:
-		return 22;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_0:
-		return 30;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_1:
-		return 31;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_2:
-		return 32;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_0:
-		return 40;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_1:
-		return 41;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_2:
-		return 42;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_5_0:
-		return 50;
-	case V4L2_MPEG_VIDEO_H264_LEVEL_5_1:
-		return 51;
-	default:
-		return -EINVAL;
-	}
-}
-
-static int rbsp_read_bits(struct rbsp *rbsp, int n, unsigned int *value);
-static int rbsp_write_bits(struct rbsp *rbsp, int n, unsigned int value);
-
-/*
- * When reading or writing, the emulation_prevention_three_byte is detected
- * only when the 2 one bits need to be inserted. Therefore, we are not
- * actually adding the 0x3 byte, but the 2 one bits and the six 0 bits of the
- * next byte.
- */
-#define EMULATION_PREVENTION_THREE_BYTE (0x3 << 6)
-
-static int add_emulation_prevention_three_byte(struct rbsp *rbsp)
-{
-	rbsp->num_consecutive_zeros = 0;
-	rbsp_write_bits(rbsp, 8, EMULATION_PREVENTION_THREE_BYTE);
-
-	return 0;
-}
-
-static int discard_emulation_prevention_three_byte(struct rbsp *rbsp)
-{
-	unsigned int tmp = 0;
-
-	rbsp->num_consecutive_zeros = 0;
-	rbsp_read_bits(rbsp, 8, &tmp);
-	if (tmp != EMULATION_PREVENTION_THREE_BYTE)
-		return -EINVAL;
-
-	return 0;
-}
-
-static inline int rbsp_read_bit(struct rbsp *rbsp)
-{
-	int shift;
-	int ofs;
-	int bit;
-	int err;
-
-	if (rbsp->num_consecutive_zeros == 22) {
-		err = discard_emulation_prevention_three_byte(rbsp);
-		if (err)
-			return err;
-	}
-
-	shift = 7 - (rbsp->pos % 8);
-	ofs = rbsp->pos / 8;
-	if (ofs >= rbsp->size)
-		return -EINVAL;
-
-	bit = (rbsp->data[ofs] >> shift) & 1;
-
-	rbsp->pos++;
-
-	if (bit == 1 ||
-	    (rbsp->num_consecutive_zeros < 7 && (rbsp->pos % 8 == 0)))
-		rbsp->num_consecutive_zeros = 0;
-	else
-		rbsp->num_consecutive_zeros++;
-
-	return bit;
-}
-
-static inline int rbsp_write_bit(struct rbsp *rbsp, bool value)
-{
-	int shift;
-	int ofs;
-
-	if (rbsp->num_consecutive_zeros == 22)
-		add_emulation_prevention_three_byte(rbsp);
-
-	shift = 7 - (rbsp->pos % 8);
-	ofs = rbsp->pos / 8;
-	if (ofs >= rbsp->size)
-		return -EINVAL;
-
-	rbsp->data[ofs] &= ~(1 << shift);
-	rbsp->data[ofs] |= value << shift;
-
-	rbsp->pos++;
-
-	if (value ||
-	    (rbsp->num_consecutive_zeros < 7 && (rbsp->pos % 8 == 0))) {
-		rbsp->num_consecutive_zeros = 0;
-	} else {
-		rbsp->num_consecutive_zeros++;
-	}
-
-	return 0;
-}
-
-static inline int rbsp_read_bits(struct rbsp *rbsp, int n, unsigned int *value)
-{
-	int i;
-	int bit;
-	unsigned int tmp = 0;
-
-	if (n > 8 * sizeof(*value))
-		return -EINVAL;
-
-	for (i = n; i > 0; i--) {
-		bit = rbsp_read_bit(rbsp);
-		if (bit < 0)
-			return bit;
-		tmp |= bit << (i - 1);
-	}
-
-	if (value)
-		*value = tmp;
-
-	return 0;
-}
-
-static int rbsp_write_bits(struct rbsp *rbsp, int n, unsigned int value)
-{
-	int ret;
-
-	if (n > 8 * sizeof(value))
-		return -EINVAL;
-
-	while (n--) {
-		ret = rbsp_write_bit(rbsp, (value >> n) & 1);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int rbsp_read_uev(struct rbsp *rbsp, unsigned int *value)
-{
-	int leading_zero_bits = 0;
-	unsigned int tmp = 0;
-	int ret;
-
-	while ((ret = rbsp_read_bit(rbsp)) == 0)
-		leading_zero_bits++;
-	if (ret < 0)
-		return ret;
-
-	if (leading_zero_bits > 0) {
-		ret = rbsp_read_bits(rbsp, leading_zero_bits, &tmp);
-		if (ret)
-			return ret;
-	}
-
-	if (value)
-		*value = (1 << leading_zero_bits) - 1 + tmp;
-
-	return 0;
-}
-
-static int rbsp_write_uev(struct rbsp *rbsp, unsigned int *value)
-{
-	int ret;
-	int leading_zero_bits;
-
-	if (!value)
-		return -EINVAL;
-
-	leading_zero_bits = ilog2(*value + 1);
-
-	ret = rbsp_write_bits(rbsp, leading_zero_bits, 0);
-	if (ret)
-		return ret;
-
-	return rbsp_write_bits(rbsp, leading_zero_bits + 1, *value + 1);
-}
-
-static int rbsp_read_sev(struct rbsp *rbsp, int *value)
-{
-	int ret;
-	unsigned int tmp;
-
-	ret = rbsp_read_uev(rbsp, &tmp);
-	if (ret)
-		return ret;
-
-	if (value) {
-		if (tmp & 1)
-			*value = (tmp + 1) / 2;
-		else
-			*value = -(tmp / 2);
-	}
-
-	return 0;
-}
-
-static int rbsp_write_sev(struct rbsp *rbsp, int *value)
-{
-	unsigned int tmp;
-
-	if (!value)
-		return -EINVAL;
-
-	if (*value > 0)
-		tmp = (2 * (*value)) | 1;
-	else
-		tmp = -2 * (*value);
-
-	return rbsp_write_uev(rbsp, &tmp);
-}
-
-static int __rbsp_write_bit(struct rbsp *rbsp, int *value)
-{
-	return rbsp_write_bit(rbsp, *value);
-}
-
-static int __rbsp_write_bits(struct rbsp *rbsp, int n, unsigned int *value)
-{
-	return rbsp_write_bits(rbsp, n, *value);
-}
-
-static struct nal_h264_ops write = {
-	.rbsp_bit = __rbsp_write_bit,
-	.rbsp_bits = __rbsp_write_bits,
-	.rbsp_uev = rbsp_write_uev,
-	.rbsp_sev = rbsp_write_sev,
-};
-
-static int __rbsp_read_bit(struct rbsp *rbsp, int *value)
-{
-	int tmp = rbsp_read_bit(rbsp);
-
-	if (tmp < 0)
-		return tmp;
-	*value = tmp;
-
-	return 0;
-}
-
-static struct nal_h264_ops read = {
-	.rbsp_bit = __rbsp_read_bit,
-	.rbsp_bits = rbsp_read_bits,
-	.rbsp_uev = rbsp_read_uev,
-	.rbsp_sev = rbsp_read_sev,
-};
-
-static inline void rbsp_bit(struct rbsp *rbsp, int *value)
-{
-	if (rbsp->error)
-		return;
-	rbsp->error = rbsp->ops->rbsp_bit(rbsp, value);
-}
-
-static inline void rbsp_bits(struct rbsp *rbsp, int n, int *value)
-{
-	if (rbsp->error)
-		return;
-	rbsp->error = rbsp->ops->rbsp_bits(rbsp, n, value);
-}
-
-static inline void rbsp_uev(struct rbsp *rbsp, unsigned int *value)
-{
-	if (rbsp->error)
-		return;
-	rbsp->error = rbsp->ops->rbsp_uev(rbsp, value);
-}
-
-static inline void rbsp_sev(struct rbsp *rbsp, int *value)
-{
-	if (rbsp->error)
-		return;
-	rbsp->error = rbsp->ops->rbsp_sev(rbsp, value);
-}
-
-static void nal_h264_rbsp_trailing_bits(struct rbsp *rbsp)
-{
-	unsigned int rbsp_stop_one_bit = 1;
-	unsigned int rbsp_alignment_zero_bit = 0;
-
-	rbsp_bit(rbsp, &rbsp_stop_one_bit);
-	rbsp_bits(rbsp, round_up(rbsp->pos, 8) - rbsp->pos,
-		  &rbsp_alignment_zero_bit);
-}
 
 static void nal_h264_write_start_code_prefix(struct rbsp *rbsp)
 {
@@ -767,7 +371,7 @@ ssize_t nal_h264_write_sps(const struct device *dev,
 
 	nal_h264_rbsp_sps(&rbsp, sps);
 
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	if (rbsp.error)
 		return rbsp.error;
@@ -814,7 +418,7 @@ ssize_t nal_h264_read_sps(const struct device *dev,
 
 	nal_h264_rbsp_sps(&rbsp, sps);
 
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	if (rbsp.error)
 		return rbsp.error;
@@ -859,7 +463,7 @@ ssize_t nal_h264_write_pps(const struct device *dev,
 
 	nal_h264_rbsp_pps(&rbsp, pps);
 
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	if (rbsp.error)
 		return rbsp.error;
@@ -896,7 +500,7 @@ ssize_t nal_h264_read_pps(const struct device *dev,
 
 	nal_h264_rbsp_pps(&rbsp, pps);
 
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	if (rbsp.error)
 		return rbsp.error;
@@ -942,7 +546,7 @@ ssize_t nal_h264_write_filler(const struct device *dev, void *dest, size_t n)
 
 	nal_h264_write_filler_data(&rbsp);
 
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	return DIV_ROUND_UP(rbsp.pos, 8);
 }
@@ -991,7 +595,7 @@ ssize_t nal_h264_read_filler(const struct device *dev, void *src, size_t n)
 		return -EINVAL;
 
 	nal_h264_read_filler_data(&rbsp);
-	nal_h264_rbsp_trailing_bits(&rbsp);
+	rbsp_trailing_bits(&rbsp);
 
 	if (rbsp.error)
 		return rbsp.error;

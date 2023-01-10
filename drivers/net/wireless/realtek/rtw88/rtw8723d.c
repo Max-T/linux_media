@@ -60,8 +60,8 @@ static const struct rtw_hw_reg rtw8723d_txagc[] = {
 #define WLAN_MAX_AGG_NR		0x0A
 #define WLAN_AMPDU_MAX_TIME	0x1C
 #define WLAN_ANT_SEL		0x82
-#define WLAN_LTR_IDLE_LAT	0x883C883C
-#define WLAN_LTR_ACT_LAT	0x880B880B
+#define WLAN_LTR_IDLE_LAT	0x90039003
+#define WLAN_LTR_ACT_LAT	0x883c883c
 #define WLAN_LTR_CTRL1		0xCB004010
 #define WLAN_LTR_CTRL2		0x01233425
 
@@ -2753,6 +2753,7 @@ struct rtw_chip_info rtw8723d_hw_spec = {
 	.scbd_support = true,
 	.new_scbd10_def = true,
 	.ble_hid_profile_support = false,
+	.wl_mimo_ps_support = false,
 	.pstdma_type = COEX_PSTDMA_FORCE_LPSOFF,
 	.bt_rssi_type = COEX_BTRSSI_RATIO,
 	.ant_isolation = 15,
